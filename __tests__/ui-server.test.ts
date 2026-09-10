@@ -5,6 +5,7 @@ import type { McpServerManager } from "../server-manager.ts";
 import type { ConsentManager } from "../consent-manager.ts";
 import type { McpConfig, UiResourceContent } from "../types.ts";
 import type { McpExtensionState } from "../state.ts";
+import { getToolApprovalIdentity, makeToolApprovalKey } from "../session-approvals.ts";
 
 // Helper to make HTTP requests to the server
 async function request(
@@ -188,6 +189,8 @@ describe("UiServer", () => {
       expect(handle.port).toBeGreaterThanOrEqual(8377);
       expect(handle.port).toBeLessThanOrEqual(8396);
       expect(handle.url).toContain(`http://localhost:${handle.port}`);
+      expect(handle.proxyPort).not.toBe(handle.port);
+      expect(handle.proxyUrl).toBe(`http://localhost:${handle.proxyPort}/sandbox`);
       expect(handle.sessionToken).toBeTruthy();
     });
 
@@ -218,6 +221,76 @@ describe("UiServer", () => {
 
       expect(handle.serverName).toBe("my-server");
       expect(handle.toolName).toBe("my_tool");
+    });
+
+    it("serves a tokenless second-origin sandbox proxy", async () => {
+      handle = await startUiServer(createServerOptions());
+
+      const res = await request(handle.proxyUrl);
+
+      expect(res.status).toBe(200);
+      expect(res.headers["content-type"]).toContain("text/html");
+      expect(res.headers["content-security-policy"]).toContain(
+        "sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-same-origin",
+      );
+      expect(res.headers["content-security-policy"]).not.toContain("allow-popups-to-escape-sandbox");
+      expect(res.body).toContain(`const EXPECTED_PARENT_ORIGIN = "http://localhost:${handle.port}"`);
+      expect(res.body).toContain("ui/notifications/sandbox-proxy-ready");
+      expect(res.body).toContain("event.source === window.parent && event.origin === EXPECTED_PARENT_ORIGIN");
+      expect(res.body).toContain("event.source === innerFrame.contentWindow && event.origin === window.location.origin");
+      expect(res.body).not.toContain(handle.sessionToken);
+      expect(res.body).not.toContain("UI_RESOURCE_TOKEN");
+
+      expect((await request(`${handle.proxyUrl}/ui-app`)).status).toBe(404);
+      expect((await request(`${handle.proxyUrl}/proxy/ui/heartbeat`, {
+        method: "POST",
+        body: { token: handle.sessionToken, params: {} },
+      })).status).toBe(404);
+    });
+
+    it("does not resolve a handle after completion races sandbox proxy startup", async () => {
+      const tempServer = http.createServer();
+      await new Promise<void>((resolve) => tempServer.listen(0, "127.0.0.1", resolve));
+      const freePort = (tempServer.address() as { port: number }).port;
+      await new Promise<void>((resolve, reject) => tempServer.close((error) => error ? reject(error) : resolve()));
+
+      const realCreateServer = http.createServer.bind(http);
+      const createServerSpy = vi.spyOn(http, "createServer");
+      let createdServers = 0;
+      let finishProxyListen: (() => void) | undefined;
+      createServerSpy.mockImplementation(((...args: Parameters<typeof http.createServer>) => {
+        const created = realCreateServer(...args);
+        createdServers += 1;
+        if (createdServers === 2) {
+          const realListen = created.listen.bind(created);
+          vi.spyOn(created, "listen").mockImplementation(((...listenArgs: unknown[]) => {
+            const callback = typeof listenArgs.at(-1) === "function" ? listenArgs.pop() as () => void : undefined;
+            finishProxyListen = () => callback?.();
+            return realListen(...listenArgs as [number, string]);
+          }) as http.Server["listen"]);
+        }
+        return created;
+      }) as typeof http.createServer);
+
+      try {
+        const startup = startUiServer(createServerOptions({
+          port: freePort,
+          sessionToken: "startup-race-token",
+        }));
+
+        await vi.waitFor(() => expect(finishProxyListen).toBeTypeOf("function"));
+        const complete = await request(`http://localhost:${freePort}/proxy/ui/complete`, {
+          method: "POST",
+          body: { token: "startup-race-token", params: { reason: "done" } },
+        });
+
+        expect(complete.status).toBe(200);
+        finishProxyListen?.();
+        await expect(startup).rejects.toThrow("UI session completed before sandbox proxy was ready");
+      } finally {
+        createServerSpy.mockRestore();
+        handle = null;
+      }
     });
   });
 
@@ -469,6 +542,23 @@ describe("UiServer", () => {
       sse.close();
 
       expect(events.some((e) => e.name === "tool-result")).toBe(true);
+    });
+
+    it("signals resource updates without reloading the open UI", async () => {
+      handle = await startUiServer(createServerOptions());
+      const url = `http://localhost:${handle.port}/events?session=${handle.sessionToken}`;
+      const events: Array<{ name: string; data: unknown }> = [];
+      const sse = await connectSSE(url, (name, data) => events.push({ name, data }));
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      handle.sendResourceUpdated("ui://fixture/app");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      sse.close();
+
+      expect(events.find(event => event.name === "resource-updated")?.data).toEqual({
+        uri: "ui://fixture/app",
+      });
+      expect(events.some(event => event.name === "session-complete")).toBe(false);
     });
 
     it("receives result-patch events when sent", async () => {
@@ -887,6 +977,51 @@ describe("UiServer", () => {
         },
       });
       expect(mockClient.callTool).not.toHaveBeenCalled();
+    });
+
+    it("keeps iframe consent separate while hashing the app tool definition", async () => {
+      const inputSchema = { type: "object", properties: { query: { type: "string" } } };
+      const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "called" }] });
+      const manager = createMockManager({
+        getConnection: vi.fn().mockReturnValue({
+          status: "connected",
+          client: { callTool },
+          tools: [{
+            name: "some_tool",
+            inputSchema,
+            _meta: { ui: { visibility: ["app"], resourceUri: "ui://demo/app" } },
+          }],
+          resources: [],
+        }),
+      });
+      const config: McpConfig = {
+        mcpServers: { "test-server": { command: "demo", approveTools: true } },
+      };
+      const state = {
+        config,
+        approvedToolCalls: new Map(),
+        toolMetadata: new Map(),
+        ui: { select: vi.fn().mockResolvedValue("Allow for session") },
+      } as unknown as McpExtensionState;
+      handle = await startUiServer(createServerOptions({ manager, config, state }));
+
+      const res = await request(`http://localhost:${handle.port}/proxy/tools/call`, {
+        method: "POST",
+        body: {
+          token: handle.sessionToken,
+          params: { name: "some_tool", arguments: { query: "safe" } },
+        },
+      });
+
+      expect(res.body).toEqual({ ok: true, result: { content: [{ type: "text", text: "called" }] } });
+      const identity = getToolApprovalIdentity("test-server", {
+        originalName: "some_tool",
+        inputSchema,
+        uiResourceUri: "ui://demo/app",
+      }, { query: "safe" });
+      expect(state.approvedToolCalls).toEqual(new Map([
+        [makeToolApprovalKey("test-server", "some_tool", identity.definitionHash, identity.argsHash), true],
+      ]));
     });
 
     it("checks consent before calling tool", async () => {
@@ -1498,6 +1633,18 @@ describe("UiServer", () => {
       handle.close();
 
       expect(onComplete).toHaveBeenCalledWith("closed");
+    });
+
+    it("closes both host and sandbox proxy listeners", async () => {
+      handle = await startUiServer(createServerOptions());
+      const hostUrl = handle.url;
+      const proxyUrl = handle.proxyUrl;
+
+      handle.close("manual-close");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      await expect(request(hostUrl)).rejects.toThrow();
+      await expect(request(proxyUrl)).rejects.toThrow();
     });
   });
 

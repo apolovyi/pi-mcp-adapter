@@ -1,6 +1,7 @@
 ---
 name: mcp-scripting
 description: Write mcpScript JavaScript for discovering, inspecting, and calling MCP tools.
+disable-model-invocation: true
 ---
 
 # MCP scripting
@@ -34,7 +35,17 @@ return result.data;
 
 `tools` is a non-enumerable proxy: `Object.keys(tools)` throws. Always use `tools.search` for discovery. When a known flat path is a valid identifier, direct calls such as `tools.github_search_issues(args)` are supported; use bracket syntax for hyphenated names: `tools["server_tool-name"](args)`. `search`, `call`, `capture`, `describe`, and promise/serialization names (`then`, `catch`, `finally`, `toJSON`, `toString`, `valueOf`) are reserved on the proxy; if a flat path collides with one, call it via `tools.call("exact-path", args)`.
 
-`tools.search` and `tools.describe` are asynchronous and must be awaited. The default script timeout is 30 seconds; the worker is terminated at the deadline, including for infinite loops. Every invocation still uses normal lazy connection, authentication, output guarding, and approval gates. Result details contain a concise `calls` trace with every search, describe, and call operation; each entry includes its query or path, outcome, and duration.
+Descriptors include `inputTypeScript` (a compact parameter shape, or formatted schema fallback). When a compact shape would omit documented fields, `inputGuidance` preserves their descriptions, including formats and units. Undocumented inputs stay compact.
+
+When advertised by the server, `outputSchema` is the original JSON Schema and `outputSchemaTarget` is `"data.structuredContent"`: it describes structured output inside the successful `{ ok: true, data }` call envelope, not the envelope itself. Inspect this schema for result fields and constraints; unsupported constructs remain intact rather than being presented as an approximate TypeScript type. Both output fields are absent when no output schema is advertised. Discovery and cache refresh preserve these optional schemas; old cache entries gain them on the next server metadata refresh. Ordinary search results do not include schemas.
+
+On success, `data` may still be the raw MCP `CallToolResult` envelope rather than the domain payload. Check `data.structuredContent` for the fields your script expects; if they are absent, inspect text blocks in `data.content` too (some servers emit newline-delimited JSON). If neither shape is understood, return or emit the envelope for inspection instead of coercing it to `[]` or `{}`.
+
+Successful intermediate data is not presentation-truncated, summarized, or spilled by the output guard. A fixed **16 MiB cumulative UTF-8 JSON transfer budget per script** covers successful data across sequential and parallel calls. A result exceeding the remaining budget throws with code `intermediate_result_too_large` and records a failed call trace. Rejected bytes do not consume the budget; use `tools.capture` to inspect the failure envelope and deliberately continue, request less data, or start a new script. There is no cap configuration. Resource calls still return transformed text (or `"(empty resource)"`). Only values you emit, log, or return become script output, which retains the normal final output guard; ordinary MCP calls remain guarded.
+
+Upstream tools execute before budget rejection and may already have side effects. The budget does not bound total memory: SDK objects, serialization of even rejected results, copies, concurrent responses, and script-created values still allocate memory. Synchronous serialization can delay deadline handling.
+
+`tools.search` and `tools.describe` are asynchronous and must be awaited. The default script timeout is 30 seconds; the worker is terminated at the deadline, including for infinite loops. Every invocation still uses normal lazy connection, authentication, and approval gates. Result details contain a concise `calls` trace with every search, describe, and call operation; each entry includes its query or path, outcome, and duration.
 
 Arguments are validated against the current advertised input schema before approval and tool dispatch. Validation failures report `phase: "validation"` and `execution: "not_started"`; invalid metadata is not silently downgraded. Re-describe or explicitly reconnect when metadata is stale; never guess replacement fields.
 

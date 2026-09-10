@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -194,6 +194,113 @@ describe("McpOAuthProvider discovery state", () => {
       delete process.env.MCP_OAUTH_DIR;
     } else {
       process.env.MCP_OAUTH_DIR = originalOAuthDir;
+    }
+  });
+
+  it("loads configured authorization-server metadata and binds it to the resource", async () => {
+    const serverUrl = "https://service.example.test/mcp";
+    const controller = new AbortController();
+    const metadataUrl = "https://auth.example.test/oauth2/default/.well-known/openid-configuration";
+    const metadata = {
+      issuer: "https://auth.example.test/oauth2/default",
+      authorization_endpoint: "https://auth.example.test/oauth2/default/authorize",
+      token_endpoint: "https://auth.example.test/oauth2/default/token",
+      response_types_supported: ["code"],
+    };
+    const response = () => new Response(JSON.stringify(metadata), {
+      headers: { "content-type": "application/json" },
+    });
+    const fetchMock = vi.fn().mockImplementation(() => response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const provider = new McpOAuthProvider(
+        "configured-metadata",
+        serverUrl,
+        { authServerMetadataUrl: metadataUrl },
+        { onRedirect: async () => {} },
+        {},
+        controller.signal,
+      );
+
+      await expect(provider.discoveryState()).resolves.toMatchObject({
+        authorizationServerUrl: metadata.issuer,
+        authorizationServerMetadata: metadata,
+        resourceMetadata: { resource: serverUrl },
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [input, init] = fetchMock.mock.calls[0]!;
+      expect(input).toBe(metadataUrl);
+      expect(Object.fromEntries(new Headers(init.headers))).toEqual({ accept: "application/json" });
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(init.signal.aborted).toBe(false);
+      controller.abort();
+      expect(init.signal.aborted).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps configured issuer validation enabled unless explicitly skipped", async () => {
+    const metadataUrl = "https://auth.example.com/.well-known/openid-configuration/tenant";
+    const customMetadataUrl = "https://auth.example.com/oauth/metadata";
+    const metadata = {
+      issuer: "https://attacker.example.com",
+      authorization_endpoint: "https://attacker.example.com/authorize",
+      token_endpoint: "https://attacker.example.com/token",
+      response_types_supported: ["code"],
+    };
+    const sameOriginTenantMetadata = {
+      issuer: "https://auth.example.com/other-tenant",
+      authorization_endpoint: "https://auth.example.com/other-tenant/authorize",
+      token_endpoint: "https://auth.example.com/other-tenant/token",
+      response_types_supported: ["code"],
+    };
+    const response = () => new Response(JSON.stringify(metadata), {
+      headers: { "content-type": "application/json" },
+    });
+    const fetchMock = vi.fn().mockImplementation(() => response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const rejectingProvider = new McpOAuthProvider(
+        "configured-metadata-mismatch",
+        serverUrl,
+        { authServerMetadataUrl: metadataUrl },
+        { onRedirect: async () => {} },
+      );
+      await expect(rejectingProvider.discoveryState()).rejects.toThrow("metadata issuer does not match");
+
+      const rejectingCustomProvider = new McpOAuthProvider(
+        "configured-custom-metadata-mismatch",
+        serverUrl,
+        { authServerMetadataUrl: customMetadataUrl },
+        { onRedirect: async () => {} },
+      );
+      await expect(rejectingCustomProvider.discoveryState()).rejects.toThrow("metadata issuer does not match");
+
+      fetchMock.mockImplementation(() => new Response(JSON.stringify(sameOriginTenantMetadata), {
+        headers: { "content-type": "application/json" },
+      }));
+      const rejectingCustomTenantProvider = new McpOAuthProvider(
+        "configured-custom-metadata-tenant-mismatch",
+        serverUrl,
+        { authServerMetadataUrl: customMetadataUrl },
+        { onRedirect: async () => {} },
+      );
+      await expect(rejectingCustomTenantProvider.discoveryState()).rejects.toThrow("metadata issuer does not match");
+
+      const allowedProvider = new McpOAuthProvider(
+        "configured-metadata-skip",
+        serverUrl,
+        { authServerMetadataUrl: customMetadataUrl, skipIssuerMetadataValidation: true },
+        { onRedirect: async () => {} },
+      );
+      await expect(allowedProvider.discoveryState()).resolves.toMatchObject({
+        authorizationServerUrl: sameOriginTenantMetadata.issuer,
+      });
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 

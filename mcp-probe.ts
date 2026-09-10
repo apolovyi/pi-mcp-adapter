@@ -5,6 +5,7 @@ const JSON_ACCEPT = "application/json, text/event-stream";
 const SSE_ACCEPT = "text/event-stream";
 const MODERN_FALLBACK_STATUSES = new Set([400, 401, 404, 405, 406, 415]);
 const POST_ENDPOINT_MISMATCH_STATUSES = new Set([404, 405, 406, 415]);
+const AMBIGUOUS_STATUSES = new Set([202, 401, 503]);
 
 export interface McpProbeResult {
   isMcp: boolean;
@@ -163,25 +164,38 @@ async function probe(url: string | URL, strategy: ProbeStrategy): Promise<ProbeR
 }
 
 function notMcp(response: Response): McpProbeResult {
+  const responseDescription = `endpoint returned ${responseKind(response)} (${response.status})`;
   return {
     isMcp: false,
-    classification: `endpoint returned ${responseKind(response)} (${response.status}) — this URL does not appear to speak MCP`,
+    classification: response.status === 503
+      ? `${responseDescription} — server is temporarily unavailable; MCP endpoint shape could not be determined`
+      : response.status === 202
+        ? `${responseDescription} — MCP endpoint shape could not be determined`
+      : response.status === 401
+        ? `${responseDescription} — authentication may be required; MCP endpoint shape could not be determined`
+        : `${responseDescription} — this URL does not appear to speak MCP`,
   };
+}
+
+function ambiguousNotMcp(response: Response): McpProbeResult | undefined {
+  return AMBIGUOUS_STATUSES.has(response.status) ? notMcp(response) : undefined;
 }
 
 /** Makes one unauthenticated metadata-only request to identify an HTTP endpoint's protocol shape. */
 export async function probeMcpEndpoint(url: string | URL): Promise<McpProbeResult> {
   const { response: modernResponse, outcome: modernOutcome } = await probe(url, MODERN_STRATEGY);
   if (modernOutcome.kind === "mcp") return modernOutcome.result;
+  let ambiguousResult = ambiguousNotMcp(modernResponse);
 
   if (modernOutcome.kind !== "unsupported-modern" && !MODERN_FALLBACK_STATUSES.has(modernResponse.status)) {
-    return notMcp(modernResponse);
+    return ambiguousResult ?? notMcp(modernResponse);
   }
 
   const { response: postResponse, outcome: postOutcome } = await probe(url, LEGACY_POST_STRATEGY);
   if (postOutcome.kind === "mcp") return postOutcome.result;
-  if (!POST_ENDPOINT_MISMATCH_STATUSES.has(postResponse.status)) return notMcp(postResponse);
+  ambiguousResult ??= ambiguousNotMcp(postResponse);
+  if (!POST_ENDPOINT_MISMATCH_STATUSES.has(postResponse.status)) return ambiguousNotMcp(postResponse) ?? ambiguousResult ?? notMcp(postResponse);
 
   const { response: getResponse, outcome: getOutcome } = await probe(url, LEGACY_SSE_STRATEGY);
-  return getOutcome.kind === "mcp" ? getOutcome.result : notMcp(getResponse);
+  return getOutcome.kind === "mcp" ? getOutcome.result : ambiguousNotMcp(getResponse) ?? ambiguousResult ?? notMcp(getResponse);
 }

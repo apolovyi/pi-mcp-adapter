@@ -7,7 +7,9 @@
 
 import {
   UnauthorizedError,
+  type FetchLike,
   type AddClientAuthentication,
+  type OAuthClientInformationContext,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
 } from "@modelcontextprotocol/client"
@@ -21,14 +23,15 @@ import {
   updateTokens,
   updateClientInfo,
   clearAllCredentials,
-  clearClientInfo,
   clearCodeVerifier,
-  clearTokens,
+  invalidateAuthEntryCache,
   type AuthEntry,
   type AuthStorageOptions,
   type StoredTokens,
   type StoredClientInfo,
 } from "./mcp-auth.ts"
+import { OAuthMetadataSchema, OpenIdProviderDiscoveryMetadataSchema } from "@modelcontextprotocol/core"
+import { createOAuthFetch, type OAuthFetch } from "./mcp-auth-fetch.ts"
 import { resolveCommandSecret } from "./utils.ts"
 import { getAppClientUri, getAppName } from "./agent-dir.ts"
 
@@ -69,6 +72,18 @@ function issuersMatch(first: string, second: string): boolean {
   return first === second
     || (first.endsWith("/") && first.slice(0, -1) === second)
     || (second.endsWith("/") && second.slice(0, -1) === first)
+}
+
+function toOAuthTokens(tokens: StoredTokens): IssuerBoundTokens {
+  const result: IssuerBoundTokens = {
+    access_token: tokens.accessToken,
+    token_type: "Bearer",
+  }
+  if (tokens.refreshToken !== undefined) result.refresh_token = tokens.refreshToken
+  if (tokens.expiresAt !== undefined) result.expires_in = Math.max(0, Math.floor(tokens.expiresAt - Date.now() / 1000))
+  if (tokens.scope !== undefined) result.scope = tokens.scope
+  if (tokens.issuer !== undefined) result.issuer = tokens.issuer
+  return result
 }
 
 // Callback server configuration
@@ -118,6 +133,7 @@ export interface McpOAuthConfig {
   clientName?: string
   clientUri?: string
   logoUri?: string
+  authServerMetadataUrl?: string
   skipIssuerMetadataValidation?: boolean
 }
 
@@ -149,18 +165,103 @@ export interface McpOAuthCallbacks {
   onRedirect: (url: URL) => void | Promise<void>
 }
 
+function inferIssuerFromMetadataUrl(metadataUrl: string): string | undefined {
+  const url = new URL(metadataUrl)
+  const pathname = url.pathname.replace(/\/+$/, "") || "/"
+  const oauthPrefix = "/.well-known/oauth-authorization-server"
+  if (pathname === oauthPrefix || pathname.startsWith(`${oauthPrefix}/`)) {
+    const issuerPath = pathname.slice(oauthPrefix.length) || "/"
+    return new URL(issuerPath, url.origin).toString()
+  }
+
+  const oidcPath = "/.well-known/openid-configuration"
+  if (pathname === oidcPath || pathname.startsWith(`${oidcPath}/`)) {
+    const issuerPath = pathname.slice(oidcPath.length) || "/"
+    return new URL(issuerPath, url.origin).toString()
+  }
+  if (pathname.endsWith(oidcPath)) {
+    const issuerPath = pathname.slice(0, -oidcPath.length) || "/"
+    return new URL(issuerPath, url.origin).toString()
+  }
+  return undefined
+}
+
+function validateConfiguredIssuer(metadataUrl: string, issuer: string, skipIssuerValidation: boolean): void {
+  let parsedIssuer: URL
+  try {
+    parsedIssuer = new URL(issuer)
+  } catch (error) {
+    throw new Error("OAuth authorization-server metadata issuer must be an absolute URL", { cause: error })
+  }
+  if (parsedIssuer.protocol !== "http:" && parsedIssuer.protocol !== "https:") {
+    throw new Error("OAuth authorization-server metadata issuer must use http:// or https://")
+  }
+
+  const expectedIssuer = inferIssuerFromMetadataUrl(metadataUrl)
+  if (skipIssuerValidation) return
+  if (expectedIssuer !== undefined && !issuersMatch(expectedIssuer, issuer)) {
+    throw new Error(
+      `OAuth authorization-server metadata issuer does not match authServerMetadataUrl: expected ${expectedIssuer}`,
+    )
+  }
+  if (expectedIssuer === undefined && !issuersMatch(new URL(metadataUrl).origin, issuer)) {
+    throw new Error(
+      `OAuth authorization-server metadata issuer does not match authServerMetadataUrl origin: expected ${new URL(metadataUrl).origin}`,
+    )
+  }
+}
+
+async function loadConfiguredDiscoveryState(
+  metadataUrl: string,
+  serverUrl: string,
+  skipIssuerValidation: boolean,
+  fetchFn: FetchLike,
+): Promise<OAuthDiscoveryState> {
+  const response = await fetchFn(metadataUrl, {
+    headers: { accept: "application/json" },
+  })
+  if (!response.ok) {
+    await response.text().catch(() => {})
+    throw new Error(`OAuth authServerMetadataUrl request failed with HTTP ${response.status}`)
+  }
+
+  const payload = await response.json()
+  const oauthResult = OAuthMetadataSchema.safeParse(payload)
+  const metadata = oauthResult.success
+    ? oauthResult.data
+    : OpenIdProviderDiscoveryMetadataSchema.parse(payload)
+  validateConfiguredIssuer(metadataUrl, metadata.issuer, skipIssuerValidation)
+
+  const resource = new URL(serverUrl)
+  resource.hash = ""
+  return {
+    authorizationServerUrl: metadata.issuer,
+    authorizationServerMetadata: metadata,
+    // The configured AS document is authoritative, so avoid a second PRM
+    // lookup while still binding the token request to the configured resource.
+    resourceMetadata: { resource: resource.toString() },
+  }
+}
+
 /**
  * OAuth provider implementation for MCP servers.
  * Implements the OAuthClientProvider interface from the MCP SDK.
  */
 export class McpOAuthProvider implements OAuthClientProvider {
   private readonly redirectUrlSnapshot: string | undefined
+  private authFetch: OAuthFetch
   private active = true
   private flowClientInfo: StoredClientInfo | undefined
   private flowCodeVerifier: string | undefined
   private flowDiscoveryState: OAuthDiscoveryState | undefined
   private flowIssuerMismatch = false
   private flowState: string | undefined
+  private invalidatedAccessToken: string | undefined
+  private invalidatedClientId: string | undefined
+  private staleRedirectClientId: string | undefined
+  private lastObservedClientId: string | undefined
+  private lastSavedAccessToken: string | undefined
+  private pendingAuthAccessToken: string | undefined
 
   constructor(
     private serverName: string,
@@ -171,10 +272,15 @@ export class McpOAuthProvider implements OAuthClientProvider {
     private runtimeSignal?: AbortSignal,
     initialState?: string,
   ) {
+    this.authFetch = createOAuthFetch(serverUrl, undefined, runtimeSignal)
     this.flowState = initialState
     this.redirectUrlSnapshot = config.grantType === "client_credentials"
       ? undefined
       : config.redirectUri ?? `http://localhost:${getOAuthCallbackPort()}${getOAuthCallbackPath()}`
+  }
+
+  setAuthFetch(fetchFn: OAuthFetch): void {
+    this.authFetch = fetchFn
   }
 
   private get usesClientCredentials(): boolean {
@@ -188,6 +294,12 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   deactivate(): void {
     this.active = false
+    this.invalidatedAccessToken = undefined
+    this.invalidatedClientId = undefined
+    this.staleRedirectClientId = undefined
+    this.lastObservedClientId = undefined
+    this.lastSavedAccessToken = undefined
+    this.pendingAuthAccessToken = undefined
   }
 
   private assertStoredIssuerBindings(entry: AuthEntry | undefined, issuer: string | undefined): void {
@@ -211,6 +323,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private throwIfInactive(): void {
     if (!this.active) throw new Error("OAuth flow is no longer active")
     this.runtimeSignal?.throwIfAborted()
+    // The SDK can swallow refresh fetch errors and attempt browser authorization.
+    // A failed service credential must stop that fallback and token persistence.
+    this.authFetch.throwIfHeaderResolutionFailed()
   }
 
   /**
@@ -264,6 +379,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
    * Returns undefined if no client info exists or if the server URL has changed.
    */
   async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
+    if (this.invalidatedClientId !== undefined) {
+      invalidateAuthEntryCache(this.serverName)
+    }
     const issuer = this.discoveredIssuer
     const stored = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
     this.assertStoredIssuerBindings(stored, issuer)
@@ -298,7 +416,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
     // Keep client registration associated with this in-flight flow even if
     // another runtime writes the shared persistent entry for the same name.
     const clientInfo = this.flowClientInfo ?? stored?.clientInfo
+    if (clientInfo?.clientId === this.invalidatedClientId) return undefined
     if (clientInfo) {
+      this.invalidatedClientId = undefined
       // A stored SEP-2352 issuer stub for a config-pre-registered client
       // (identified by the explicit marker, or by the legacy stub shape of
       // {clientId, issuer} with no registration metadata) is only meaningful
@@ -327,8 +447,16 @@ export class McpOAuthProvider implements OAuthClientProvider {
         this.flowClientInfo = clientInfo
         updateClientInfo(this.serverName, clientInfo, this.serverUrl, this.storageOptions)
       }
+      // Keep a stale dynamic registration available for its refresh attempt,
+      // but suppress it if that attempt invalidates the token and auth falls
+      // back to an interactive flow. The next clientInformation() call then
+      // makes the SDK register the current callback URI.
+      const redirectUriIsStale = this.redirectUrl !== undefined
+        && (!Array.isArray(clientInfo.redirectUris) || !clientInfo.redirectUris.includes(this.redirectUrl))
+      this.staleRedirectClientId = redirectUriIsStale ? clientInfo.clientId : undefined
       // Return all registration metadata and the local issuer extension.
       // This keeps the SDK OAuth view and the stored issuer binding consistent.
+      this.lastObservedClientId = clientInfo.clientId
       return {
         client_id: clientInfo.clientId,
         client_secret: clientInfo.clientSecret,
@@ -380,6 +508,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
       ...(issuer !== undefined ? { issuer } : {}),
     }
     this.flowClientInfo = clientInfo
+    this.invalidatedClientId = undefined
+    this.lastObservedClientId = clientInfo.clientId
     updateClientInfo(this.serverName, clientInfo, this.serverUrl, this.storageOptions)
   }
 
@@ -387,27 +517,28 @@ export class McpOAuthProvider implements OAuthClientProvider {
    * Get stored OAuth tokens.
    * Returns undefined if no tokens exist or if the server URL has changed.
    */
-  async tokens(): Promise<OAuthTokens | undefined> {
+  async tokens(ctx?: OAuthClientInformationContext): Promise<OAuthTokens | undefined> {
+    // Once this provider rejects a token, bypass its process-local cache until
+    // another process replaces that token in shared secure storage.
+    if (this.invalidatedAccessToken !== undefined) {
+      invalidateAuthEntryCache(this.serverName)
+    }
+
     // Use getAuthForUrl to validate tokens are for the current server URL.
     const entry = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
-    if (!entry?.tokens) return undefined
+    if (!entry?.tokens || entry.tokens.accessToken === this.invalidatedAccessToken) return undefined
+    this.invalidatedAccessToken = undefined
     const issuer = this.discoveredIssuer
     this.assertStoredIssuerBindings(entry, issuer)
     if (issuer && entry.tokens.issuer === undefined) {
       entry.tokens.issuer = issuer
       updateTokens(this.serverName, entry.tokens, this.serverUrl, this.storageOptions)
     }
+    if (ctx !== undefined) {
+      this.pendingAuthAccessToken = entry.tokens.accessToken
+    }
 
-    return {
-      access_token: entry.tokens.accessToken,
-      token_type: "Bearer",
-      refresh_token: entry.tokens.refreshToken,
-      expires_in: entry.tokens.expiresAt
-        ? Math.max(0, Math.floor(entry.tokens.expiresAt - Date.now() / 1000))
-        : undefined,
-      scope: entry.tokens.scope,
-      ...(entry.tokens.issuer !== undefined ? { issuer: entry.tokens.issuer } : {}),
-    } as IssuerBoundTokens
+    return toOAuthTokens(entry.tokens)
   }
 
   /**
@@ -427,6 +558,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
     this.throwIfInactive()
     updateTokens(this.serverName, storedTokens, this.serverUrl, this.storageOptions)
+    this.invalidatedAccessToken = undefined
+    this.lastSavedAccessToken = storedTokens.accessToken
     // Discovery must survive the browser redirect so the callback can verify
     // the authorization server that minted the code. Once token issuance
     // succeeds, clear it so a later 401 re-reads PRM and can observe an
@@ -492,6 +625,14 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
     this.throwIfInactive()
+    if (!this.flowDiscoveryState && this.config.authServerMetadataUrl !== undefined) {
+      this.flowDiscoveryState = await loadConfiguredDiscoveryState(
+        this.config.authServerMetadataUrl,
+        this.serverUrl,
+        this.config.skipIssuerMetadataValidation === true,
+        this.authFetch,
+      )
+    }
     return this.flowDiscoveryState ? structuredClone(this.flowDiscoveryState) : undefined
   }
 
@@ -533,14 +674,35 @@ export class McpOAuthProvider implements OAuthClientProvider {
         this.flowDiscoveryState = undefined
         this.flowIssuerMismatch = false
         this.flowState = undefined
+        this.invalidatedAccessToken = undefined
+        this.invalidatedClientId = undefined
+        this.staleRedirectClientId = undefined
+        this.lastObservedClientId = undefined
+        this.lastSavedAccessToken = undefined
+        this.pendingAuthAccessToken = undefined
         clearAllCredentials(this.serverName, this.storageOptions)
         break
       case "client":
+        // Dynamic client registrations share the same credential-store entry as
+        // tokens. Keep SDK invalidation local so a stale process cannot rewrite
+        // that entry over credentials another process just authorized.
+        this.invalidatedClientId = this.lastObservedClientId
+        this.lastObservedClientId = undefined
         this.flowClientInfo = undefined
-        clearClientInfo(this.serverName, this.storageOptions)
+        invalidateAuthEntryCache(this.serverName)
         break
       case "tokens":
-        clearTokens(this.serverName, this.storageOptions)
+        // Invalidation is provider-local. Persistently deleting a shared token
+        // here lets a process refreshing stale cached credentials erase a token
+        // that another process just authorized. A later tokens() call bypasses
+        // the local cache and adopts a replacement token when one exists.
+        this.invalidatedAccessToken = this.pendingAuthAccessToken ?? this.lastSavedAccessToken
+        this.lastSavedAccessToken = undefined
+        this.pendingAuthAccessToken = undefined
+        if (this.staleRedirectClientId !== undefined) {
+          this.invalidatedClientId = this.staleRedirectClientId
+        }
+        invalidateAuthEntryCache(this.serverName)
         break
       case "verifier":
         clearCodeVerifier(this.serverName, this.storageOptions)

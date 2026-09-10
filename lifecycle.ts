@@ -1,6 +1,6 @@
 import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import { isServerDisabled, type ServerDefinition } from "./types.ts";
-import type { McpServerManager, ServerConnection } from "./server-manager.ts";
+import { isTransientHttpConnectError, type McpServerManager, type ServerConnection } from "./server-manager.ts";
 import { hasPendingAuth } from "./mcp-auth-flow.ts";
 import { logger } from "./logger.ts";
 import { formatTerminalError, parallelLimit, sanitizeTerminalText } from "./utils.ts";
@@ -20,6 +20,7 @@ interface RetryState {
   nextAttemptAt: number;
   connection: ServerConnection | undefined;
   status: ServerConnection["status"] | undefined;
+  warningReported: boolean;
 }
 
 export class McpLifecycleManager {
@@ -347,6 +348,12 @@ export class McpLifecycleManager {
     return Date.now() >= retry.nextAttemptAt;
   }
 
+  private connectionFailureTarget(action: "refresh" | "reconnect" | "publish", name: string): string {
+    if (action === "reconnect") return `reconnect to ${name}`;
+    if (action === "publish") return `publish metadata for ${name}`;
+    return `refresh ${name}`;
+  }
+
   private reportConnectionFailure(
     name: string,
     definition: ServerDefinition,
@@ -356,13 +363,12 @@ export class McpLifecycleManager {
   ): void {
     if (!this.recordRetry(name, definition, connection)) return;
     this.onReconnectFailure?.(name, error);
+    if (isTransientHttpConnectError(error)) return;
+    const retry = this.retryStates.get(name);
+    if (retry?.warningReported) return;
+    if (retry) retry.warningReported = true;
     const message = error instanceof Error ? error.message : String(error);
-    const target = action === "reconnect"
-      ? `reconnect to ${name}`
-      : action === "publish"
-        ? `publish metadata for ${name}`
-        : `refresh ${name}`;
-    console.error(`MCP: Failed to ${target}: ${sanitizeTerminalText(message)}`);
+    console.error(`MCP: Failed to ${this.connectionFailureTarget(action, name)}: ${sanitizeTerminalText(message)}`);
   }
 
   private deferRefreshTimeout(
@@ -382,7 +388,8 @@ export class McpLifecycleManager {
     // Do not recreate retry/failure state from a stale convergence pass after
     // disposal or a same-name replacement registration.
     if (this.keepAliveServers.get(name) !== definition) return false;
-    const attempts = (this.retryStates.get(name)?.attempts ?? 0) + 1;
+    const previous = this.retryStates.get(name);
+    const attempts = (previous?.attempts ?? 0) + 1;
     const delay = Math.min(
       KEEP_ALIVE_RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 10),
       KEEP_ALIVE_RETRY_MAX_MS,
@@ -392,6 +399,7 @@ export class McpLifecycleManager {
       nextAttemptAt: Date.now() + delay,
       connection,
       status: connection?.status,
+      warningReported: previous?.warningReported ?? false,
     });
     return true;
   }

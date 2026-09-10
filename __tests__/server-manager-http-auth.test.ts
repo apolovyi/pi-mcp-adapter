@@ -1,8 +1,13 @@
 import { SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getAuthEntryFilePath, resetTestAuthSecretStore, saveAuthEntry } from "../mcp-auth.ts";
 
 type OAuthProviderLike = {
   redirectUrl?: string;
+  tokens?: () => Promise<unknown>;
   clientMetadata?: {
     redirect_uris?: string[];
     client_name?: string;
@@ -80,11 +85,13 @@ describe("McpServerManager HTTP bearer auth", () => {
     MCP_TEST_BEARER_TOKEN: process.env.MCP_TEST_BEARER_TOKEN,
     MCP_TEST_BEARER_TOKEN_ENV: process.env.MCP_TEST_BEARER_TOKEN_ENV,
     MCP_TEST_URL: process.env.MCP_TEST_URL,
+    MCP_OAUTH_DIR: process.env.MCP_OAUTH_DIR,
     PI_MCP_ADAPTER_TEST_AUTH_STORE: process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE,
   };
 
   beforeEach(() => {
     process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    resetTestAuthSecretStore();
     mocks.afterConnect = undefined;
     mocks.clients.length = 0;
     mocks.connectErrors.length = 0;
@@ -100,6 +107,7 @@ describe("McpServerManager HTTP bearer auth", () => {
         process.env[key] = value;
       }
     }
+    resetTestAuthSecretStore();
   });
 
 
@@ -293,6 +301,49 @@ describe("McpServerManager HTTP bearer auth", () => {
     expect(mocks.httpTransports.at(-1)!.options.authProvider).toBeUndefined();
   });
 
+  it("uses URL-bound stored OAuth tokens before implicit authentication is challenged", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+    saveAuthEntry("stored", { tokens: { accessToken: "stored-token" } }, "https://example.test/mcp");
+
+    const manager = new McpServerManager();
+    await manager.connect("stored", { url: "https://example.test/mcp" });
+
+    const authProvider = mocks.httpTransports.at(-1)!.options.authProvider;
+    expect(authProvider).toBeDefined();
+    expect(await authProvider!.tokens?.()).toMatchObject({ access_token: "stored-token" });
+  });
+
+  it("keeps implicit OAuth deferred when the credential store is unavailable", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "unavailable";
+
+    const manager = new McpServerManager();
+    await manager.connect("anonymous", { url: "https://example.test/mcp" });
+
+    expect(mocks.httpTransports.at(-1)!.options.authProvider).toBeUndefined();
+  });
+
+  it("keeps implicit OAuth deferred when stored credentials are malformed", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+    const authDir = mkdtempSync(join(tmpdir(), "pi-mcp-implicit-auth-"));
+    const previousAuthDir = process.env.MCP_OAUTH_DIR;
+    process.env.MCP_OAUTH_DIR = authDir;
+    try {
+      const filePath = getAuthEntryFilePath("malformed");
+      mkdirSync(dirname(filePath), { recursive: true });
+      writeFileSync(filePath, JSON.stringify({ tokens: { refreshToken: "missing-access-token" } }));
+
+      const manager = new McpServerManager();
+      await manager.connect("malformed", { url: "https://example.test/mcp" });
+
+      expect(mocks.httpTransports.at(-1)!.options.authProvider).toBeUndefined();
+    } finally {
+      if (previousAuthDir === undefined) delete process.env.MCP_OAUTH_DIR;
+      else process.env.MCP_OAUTH_DIR = previousAuthDir;
+      rmSync(authDir, { recursive: true, force: true });
+    }
+  });
+
   it("passes the per-request header command fetch to Streamable HTTP and SSE", async () => {
     const { McpServerManager } = await import("../server-manager.ts");
     mocks.connectErrors.push(new SdkHttpError(
@@ -437,4 +488,34 @@ describe("McpServerManager HTTP bearer auth", () => {
     expect(mocks.httpTransports).toHaveLength(1);
     expect(mocks.clients[0].connect).toHaveBeenCalledWith(mocks.httpTransports[0], { timeout: 5000 });
   });
+
+  it("scopes transport OAuth defaults instead of forwarding requestInit headers to discovered origins", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+    const originalFetch = globalThis.fetch;
+    const seen: Headers[] = [];
+    globalThis.fetch = vi.fn(async (_input, init) => {
+      seen.push(new Headers(init?.headers));
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const manager = new McpServerManager();
+    try {
+      await manager.connect("scoped", {
+        url: "https://service.example.test/mcp",
+        auth: "oauth",
+        headers: { "x-service-auth": "synthetic-service", Authorization: "service-authorization" },
+      });
+      const options = mocks.httpTransports.at(-1)!.options;
+      expect(options.requestInit).toBeUndefined();
+      await options.fetch!("https://service.example.test/token", { headers: { authorization: "Basic sdk" } });
+      await options.fetch!("https://identity.example.test/token", { headers: { authorization: "Basic sdk" } });
+      expect(seen[0]!.get("x-service-auth")).toBe("synthetic-service");
+      expect(seen[0]!.get("authorization")).toBe("Basic sdk");
+      expect(seen[1]!.get("x-service-auth")).toBeNull();
+      expect(seen[1]!.get("authorization")).toBe("Basic sdk");
+    } finally {
+      globalThis.fetch = originalFetch;
+      await manager.closeAll();
+    }
+  });
+
 });

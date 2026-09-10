@@ -45,6 +45,74 @@ describe("MCP endpoint shape probe", () => {
     });
   });
 
+  it("reports a transient server error without claiming the URL is not MCP", async () => {
+    mockFetch(new Response(JSON.stringify({
+      error: "temporarily_unavailable",
+      error_description: "Credential validation is temporarily unavailable",
+    }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    }));
+
+    const result = await probeMcpEndpoint("https://example.test/mcp");
+
+    expect(result).toMatchObject({
+      isMcp: false,
+      classification: expect.stringContaining("temporarily unavailable"),
+    });
+    expect(result.classification).not.toContain("does not appear to speak MCP");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an accepted response without claiming the URL is not MCP", async () => {
+    mockFetch(new Response("Accepted", {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    }));
+
+    const result = await probeMcpEndpoint("https://example.test/mcp");
+
+    expect(result).toMatchObject({
+      isMcp: false,
+      classification: "endpoint returned application/json (202) — MCP endpoint shape could not be determined",
+    });
+    expect(result.classification).not.toContain("does not appear to speak MCP");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an unauthenticated response without claiming the URL is not MCP", async () => {
+    mockFetch(
+      new Response("Unauthorized", { status: 401, headers: { "content-type": "application/json" } }),
+      new Response("Unauthorized", { status: 401, headers: { "content-type": "application/json" } }),
+    );
+
+    const result = await probeMcpEndpoint("https://example.test/mcp");
+
+    expect(result).toMatchObject({
+      isMcp: false,
+      classification: "endpoint returned application/json (401) — authentication may be required; MCP endpoint shape could not be determined",
+    });
+    expect(result.classification).not.toContain("does not appear to speak MCP");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps an earlier unauthenticated probe classification when fallbacks are inconclusive", async () => {
+    mockFetch(
+      new Response("Unauthorized", { status: 401, headers: { "content-type": "application/json" } }),
+      new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } }),
+      new Response("Method Not Allowed", { status: 405, headers: { "content-type": "text/plain" } }),
+    );
+
+    const result = await probeMcpEndpoint("https://example.test/mcp");
+
+    expect(result).toMatchObject({
+      isMcp: false,
+      classification: "endpoint returned application/json (401) — authentication may be required; MCP endpoint shape could not be determined",
+    });
+    expect(result.classification).not.toContain("does not appear to speak MCP");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("recognizes a modern stateless server/discover response", async () => {
     mockFetch(new Response(JSON.stringify({
       jsonrpc: "2.0", id: 1, result: { protocolVersion: "2026-07-28" },

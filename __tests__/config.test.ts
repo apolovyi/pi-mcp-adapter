@@ -242,7 +242,7 @@ describe("config discovery", () => {
     warning.mockRestore();
   });
 
-  it("keeps unspecified Agent Plugin fields when normal config overrides a plugin server", async () => {
+  it("keeps Agent Plugin fields and adapter-specific Pi overrides when normal config overrides a plugin server", async () => {
     const home = mkdtempSync(join(tmpdir(), "pi-mcp-plugin-override-home-"));
     const project = mkdtempSync(join(tmpdir(), "pi-mcp-plugin-override-project-"));
     process.env.HOME = home;
@@ -259,12 +259,13 @@ describe("config discovery", () => {
     });
     writeJson(join(project, ".mcp.json"), {
       settings: { agentPluginPaths: ["./plugins/acme-tools"] },
-      mcpServers: { acme_tools__local: { command: "override-node" } },
+      mcpServers: { acme_tools__local: { command: "override-node", inheritEnv: false } },
     });
 
     const { loadMcpConfig } = await import("../config.ts");
     expect(loadMcpConfig().mcpServers.acme_tools__local).toMatchObject({
       command: "override-node",
+      inheritEnv: false,
       args: ["plugin.js"],
       cwd: realpathSync(plugin),
       env: { PLUGIN_ROOT: realpathSync(plugin) },
@@ -545,24 +546,29 @@ describe("config discovery", () => {
 
     writeJson(join(home, ".config", "mcp", "mcp.json"), {
       mcpServers: {
-        toSocket: { command: "old", args: ["--old"], env: { OLD: "1" }, cwd: "/old" },
+        toSocket: { command: "old", args: ["--old"], env: { OLD: "1" }, cwd: "/old", inheritEnv: false },
         toCommand: { socket: "/old.sock" },
-        toUrl: { socket: "/old.sock" },
+        toUrl: { command: "old", inheritEnv: false },
       },
     });
     writeJson(join(home, ".pi", "agent", "mcp.json"), {
       mcpServers: {
         toSocket: { socket: "/shared.sock" },
-        toCommand: { command: "new" },
+        toCommand: { command: "new", inheritEnv: false },
         toUrl: { url: "https://example.test/mcp" },
+      },
+    });
+    writeJson(join(project, ".pi", "mcp.json"), {
+      mcpServers: {
+        toUrl: { command: "new-after-http" },
       },
     });
 
     const { loadMcpConfig } = await import("../config.ts");
     const servers = loadMcpConfig().mcpServers;
     expect(servers.toSocket).toEqual({ socket: "/shared.sock" });
-    expect(servers.toCommand).toEqual({ command: "new" });
-    expect(servers.toUrl).toEqual({ url: "https://example.test/mcp" });
+    expect(servers.toCommand).toEqual({ command: "new", inheritEnv: false });
+    expect(servers.toUrl).toEqual({ command: "new-after-http" });
   });
 
   it("loads tool-agnostic .agents global MCP files before Pi overrides", async () => {
@@ -1212,6 +1218,14 @@ describe("config discovery", () => {
     expect(JSON.stringify(entry)).not.toContain("REQUEST_SECRET");
   });
 
+  it.each([{ url: URL_B }, { command: "echo" }, { socket: "/tmp/mcp.sock" }])("drops inherited CA trust on endpoint replacement %j", async override => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-ca-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-ca-project-"));
+    writeBakedAndOverride(home, project, { url: URL_A, caFile: "private.pem" }, override);
+    const { loadMcpConfig } = await import("../config.ts");
+    expect(loadMcpConfig().mcpServers.litellm.caFile).toBeUndefined();
+  });
+
   it("drops inherited oauth config when a url-only override repoints the server", async () => {
     const home = mkdtempSync(join(tmpdir(), "pi-mcp-urlauth-oauth-home-"));
     const project = mkdtempSync(join(tmpdir(), "pi-mcp-urlauth-oauth-project-"));
@@ -1554,7 +1568,12 @@ describe("config discovery", () => {
           type: "remote",
           url: "https://global.test/mcp",
           headers: { "X-Global": "global", "X-Shared": "global" },
-          oauth: { clientId: "global-client", scope: "global-scope", skipIssuerMetadataValidation: false },
+          oauth: {
+            clientId: "global-client",
+            scope: "global-scope",
+            authServerMetadataUrl: "https://auth.global.test/.well-known/openid-configuration",
+            skipIssuerMetadataValidation: false,
+          },
         },
         globalOnly: { type: "local", command: ["global"] },
       },
@@ -1585,6 +1604,7 @@ describe("config discovery", () => {
           clientId: "global-client",
           scope: "project-scope",
           clientSecret: "project-secret",
+          authServerMetadataUrl: "https://auth.global.test/.well-known/openid-configuration",
           skipIssuerMetadataValidation: true,
         },
       },
@@ -1682,6 +1702,11 @@ describe("config discovery", () => {
     for (const preset of KNOWN_SERVER_PRESETS.filter(({ entry }) => entry.url)) {
       expect(preset.entry.protocolVersion).toBe("auto");
     }
+    expect(KNOWN_SERVER_PRESETS.find(({ id }) => id === "parallel-search")?.entry).toEqual({
+      url: "https://search.parallel.ai/mcp",
+      protocolVersion: "auto",
+      directTools: true,
+    });
     expect(KNOWN_SERVER_PRESETS.find(({ id }) => id === "chrome-devtools")?.entry.protocolVersion).toBeUndefined();
   });
 });

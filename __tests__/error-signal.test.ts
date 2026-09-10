@@ -2,13 +2,22 @@ import { describe, it, expect } from "vitest";
 import { toolErrorOverride } from "../error-signal.ts";
 
 describe("toolErrorOverride", () => {
-  it("flags tool-execution failures (tool_error, call_failed)", () => {
+  it("flags tool-execution failures", () => {
     expect(toolErrorOverride({ error: "tool_error", server: "x" })).toEqual({ isError: true });
     expect(toolErrorOverride({ mode: "call", error: "call_failed", message: "boom" })).toEqual({ isError: true });
+    expect(toolErrorOverride({ mode: "call", error: "input_required_needs_ui", server: "demo" })).toEqual({ isError: true });
+    expect(toolErrorOverride({ error: "input_required_needs_ui" })).toEqual({ isError: true });
   });
 
   it.each(["script_error", "timeout", "aborted"])("flags %s without losing details", (error) => {
     expect(toolErrorOverride({mode: "script", error})).toEqual({isError: true});
+  });
+
+  it("does not promote explicitly handled script failures to outer errors", () => {
+    expect(toolErrorOverride({
+      mode: "script",
+      calls: [{ path: "demo_needs_ui", ok: false, error: "input_required_needs_ui" }],
+    })).toBeUndefined();
   });
 
   it("leaves control feedback without a failed call unchanged", () => {

@@ -15,23 +15,76 @@ import { createToolSelectorCandidateIndex, formatToolName, getToolNameCandidates
 import { isUiToolVisibleToModel } from "./ui-tool-visibility.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import { authenticate, supportsOAuth } from "./mcp-auth-flow.ts";
-import { formatAuthRequiredMessage, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { formatAuthRequiredMessage, resolveServerUrl } from "./utils.ts";
 import { prepareToolArguments } from "./json-schema-validator.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
 import { combineAbortSignals, isAbortError } from "./runtime-owner.ts";
 import { ensureToolCallApproved } from "./tool-approval.ts";
+import { Check, Errors } from "typebox/value";
+import { getInputRequiredNeedsUiDetails } from "./errors.ts";
 
 type ClientCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
 type ClientReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
 
 const BUILTIN_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
-const INSTRUCTIONS_SNIPPET_LENGTH = 150;
 export const DIRECT_TOOLS_ADVISORY_THRESHOLD = 75;
 
 type DirectAutoAuthResult =
   | { status: "skipped" }
   | { status: "success" }
   | { status: "failed"; message: string };
+
+/**
+ * Recover one model-emitted JSON layer for schema-declared object and array
+ * properties, then validate the complete input against the same schema.
+ */
+export function prepareDirectToolArguments(inputSchema: unknown, args: unknown): unknown {
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return args;
+  const schema = inputSchema as Record<string, unknown>;
+  if (schema.type !== "object") return args;
+  const input = args && typeof args === "object" && !Array.isArray(args)
+    ? args as Record<string, unknown>
+    : null;
+  const properties = schema.properties;
+  let prepared: Record<string, unknown> | undefined;
+
+  if (input && properties && typeof properties === "object" && !Array.isArray(properties)) {
+    for (const [name, propertySchema] of Object.entries(properties)) {
+      if (!Object.hasOwn(input, name) || typeof input[name] !== "string"
+        || !propertySchema || typeof propertySchema !== "object" || Array.isArray(propertySchema)) continue;
+      const expectedType = (propertySchema as Record<string, unknown>).type;
+      if (expectedType !== "object" && expectedType !== "array") continue;
+      try {
+        const parsed: unknown = JSON.parse(input[name] as string);
+        const matches = expectedType === "array"
+          ? Array.isArray(parsed)
+          : parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+        if (matches) {
+          prepared ??= { ...input };
+          prepared[name] = parsed;
+        }
+      } catch {
+        // Validation below reports malformed or shape-incompatible values.
+      }
+    }
+  }
+
+  const candidate = prepared ?? args;
+  if (!Check(inputSchema as never, candidate)) {
+    const errors = Errors(inputSchema as never, candidate);
+    const issues = errors.slice(0, 8).map((error) => ({
+      instancePath: error.instancePath || "/",
+      keyword: error.keyword,
+      message: error.message,
+    }));
+    throw new TypeError(`MCP direct tool arguments do not match the advertised input schema: ${JSON.stringify({
+      issues,
+      total: errors.length,
+      truncated: errors.length > issues.length,
+    })}`);
+  }
+  return candidate;
+}
 
 function getDirectAuthRequiredMessage(
   state: McpExtensionState,
@@ -118,6 +171,8 @@ export function resolveDirectTools(
   cache: MetadataCache | null,
   prefix: ToolPrefix,
   envOverride?: string[],
+  unavailableServers: ReadonlySet<string> = new Set(),
+  reservedNames?: Set<string>,
 ): DirectToolSpec[] {
   const specs: DirectToolSpec[] = [];
   if (!cache) return specs;
@@ -225,82 +280,33 @@ export function resolveDirectTools(
     }
   }
 
-  if (config.settings?.warnOnLargeDirectTools !== false && specs.length >= DIRECT_TOOLS_ADVISORY_THRESHOLD) {
-    console.warn(`MCP: ${specs.length} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered.`);
+  for (const spec of specs) reservedNames?.add(spec.prefixedName);
+
+  const emittedSpecs = unavailableServers.size === 0
+    ? specs
+    : specs.filter((spec) => !unavailableServers.has(spec.serverName));
+
+  if (config.settings?.warnOnLargeDirectTools !== false && emittedSpecs.length >= DIRECT_TOOLS_ADVISORY_THRESHOLD) {
+    console.warn(`MCP: ${emittedSpecs.length} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered. Set settings.warnOnLargeDirectTools to false to hide this advisory.`);
   }
 
-  return specs;
+  return emittedSpecs;
 }
 
-export function buildProxyDescription(
-  config: McpConfig,
-  cache: MetadataCache | null,
-  directSpecs: DirectToolSpec[],
-): string {
-  const prefix = config.settings?.toolPrefix ?? "server";
+/**
+ * Pure function of config: the description must stay byte-stable across
+ * runtime metadata changes (tool counts, instructions, connection state) so
+ * re-registering the proxy tool never rewrites the cached prompt prefix.
+ * Live counts/status belong to `mcp({ })`, full instructions to
+ * `mcp({ instructions })`.
+ */
+export function buildProxyDescription(config: McpConfig): string {
   let desc = `MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. When one request needs several MCP calls with logic between them, use mcpScript. Non-MCP Pi tools should be called directly, not through mcp.\n`;
 
-  const directByServer = new Map<string, number>();
-  for (const spec of directSpecs) {
-    directByServer.set(spec.serverName, (directByServer.get(spec.serverName) ?? 0) + 1);
-  }
-  if (directByServer.size > 0) {
-    const parts = [...directByServer.entries()].map(
-      ([server, count]) => `${server} (${count})`,
-    );
-    desc += `\nDirect tools available (call as normal tools): ${parts.join(", ")}\n`;
-  }
-
-  const serverSummaries: string[] = [];
-  for (const serverName of Object.keys(config.mcpServers)) {
-    const definition = config.mcpServers[serverName];
-    if (!definition || isServerDisabled(definition)) continue;
-    const cachedEntry = cache?.servers?.[serverName];
-    const entry = cachedEntry && isServerCacheValid(cachedEntry, definition) ? cachedEntry : undefined;
-    const effectivePrefix = resolveToolPrefix(definition, prefix);
-    const hasToolFilters =
-      (Array.isArray(definition.includeTools) && definition.includeTools.length > 0) ||
-      (Array.isArray(definition.excludeTools) && definition.excludeTools.length > 0);
-    const selectorCandidateIndex = hasToolFilters && cache ? (() => {
-      const candidates = new Set<string>();
-      for (const [otherServerName, otherDefinition] of Object.entries(config.mcpServers)) {
-        const otherEntry = cache.servers[otherServerName];
-        if (!otherEntry || !isServerCacheValid(otherEntry, otherDefinition) || isServerDisabled(otherDefinition)) continue;
-        const otherPrefix = resolveToolPrefix(otherDefinition, prefix);
-        for (const otherTool of otherEntry.tools ?? []) {
-          if (!isUiToolVisibleToModel(otherTool.uiVisibility)) continue;
-          for (const candidate of getToolNameCandidates(otherTool.name, otherServerName, otherPrefix, false)) candidates.add(candidate);
-        }
-        if (otherDefinition.exposeResources !== false) {
-          for (const resource of otherEntry.resources ?? []) {
-            const baseName = `read_${resourceNameToToolName(resource.name)}`;
-            for (const candidate of getToolNameCandidates(baseName, otherServerName, otherPrefix, false)) candidates.add(candidate);
-          }
-        }
-      }
-      return createToolSelectorCandidateIndex(candidates);
-    })() : undefined;
-    const toolCount = (entry?.tools ?? []).filter(
-      (tool) => isUiToolVisibleToModel(tool.uiVisibility)
-        && isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools, selectorCandidateIndex),
-    ).length;
-    const resourceCount = definition?.exposeResources !== false
-      ? (entry?.resources ?? []).filter((resource) => {
-          const baseName = `read_${resourceNameToToolName(resource.name)}`;
-          return isToolAllowed(baseName, serverName, effectivePrefix, definition.includeTools, definition.excludeTools, selectorCandidateIndex);
-        }).length
-      : 0;
-    const totalItems = toolCount + resourceCount;
-    if (totalItems === 0) continue;
-    const directCount = directByServer.get(serverName) ?? 0;
-    const proxyCount = totalItems - directCount;
-    if (proxyCount > 0) {
-      serverSummaries.push(`${serverName} (${proxyCount} tools)`);
-    }
-  }
-
-  if (serverSummaries.length > 0) {
-    desc += `\nServers: ${serverSummaries.join(", ")}\n`;
+  const serverNames = Object.keys(config.mcpServers)
+    .filter((serverName) => !isServerDisabled(config.mcpServers[serverName]));
+  if (serverNames.length > 0) {
+    desc += `\nServers: ${serverNames.join(", ")}\n`;
   }
 
   const disabledServers = Object.entries(config.mcpServers)
@@ -310,22 +316,8 @@ export function buildProxyDescription(
     desc += `\nDisabled servers (enable with /mcp enable <server> and /reload): ${disabledServers.join(", ")}\n`;
   }
 
-  const instructionSummaries: string[] = [];
-  for (const serverName of Object.keys(config.mcpServers)) {
-    if (isServerDisabled(config.mcpServers[serverName])) continue;
-    const definition = config.mcpServers[serverName];
-    const entry = definition && cache?.servers?.[serverName];
-    const instructions = entry && definition && isServerCacheValid(entry, definition) ? entry.instructions : undefined;
-    if (!instructions) continue;
-    const snippet = truncateAtWord(instructions.replace(/\s+/g, " ").trim(), INSTRUCTIONS_SNIPPET_LENGTH);
-    instructionSummaries.push(`  ${serverName}: ${snippet}`);
-  }
-  if (instructionSummaries.length > 0) {
-    desc += `\nServer instructions (truncated - full text via mcp({ instructions: "name" })):\n${instructionSummaries.join("\n")}\n`;
-  }
-
   desc += `\nUsage:\n`;
-  desc += `  mcp({ })                              → Show server status\n`;
+  desc += `  mcp({ })                              → Show server status and tool counts\n`;
   desc += `  mcp({ server: "name" })               → List tools from server\n`;
   desc += `  mcp({ search: "query" })              → Search MCP tools by name/description\n`;
   desc += `  mcp({ describe: "tool_name" })        → Show tool details and parameters\n`;
@@ -505,10 +497,19 @@ export function createDirectToolExecutor(
             onNeedsAuth: recoverAuthConnection,
           },
           spec.serverName,
-          (conn) => conn.client.readResource({ uri: spec.resourceUri! }, requestOptions),
+          async (conn) => {
+            const refreshRead = await state.manager.prepareResourceUse?.(spec.serverName, spec.resourceUri!, conn);
+            return conn.client.readResource(
+              { uri: spec.resourceUri! },
+              refreshRead ? { ...requestOptions, cacheMode: "refresh" } : requestOptions,
+            );
+          },
         );
         const content = transformMcpResourceContents(result.contents ?? [], state.owner?.signal);
-        const guarded = await guardMcpOutput(content.length > 0 ? content : [{ type: "text" as const, text: "(empty resource)" }], outputGuardOptions);
+        const guarded = await guardMcpOutput(content.length > 0 ? content : [{ type: "text" as const, text: "(empty resource)" }], {
+          ...outputGuardOptions,
+          ...(state.config.settings?.directToolResultDetails === "bounded" ? { rawMcpResult: result } : {}),
+        });
         return {
           content: guarded.content,
           details: { server: spec.serverName, resourceUri: spec.resourceUri, ...guardedMcpDetails(guarded) },
@@ -536,11 +537,14 @@ export function createDirectToolExecutor(
           onNeedsAuth: recoverAuthConnection,
         },
         spec.serverName,
-        (conn) => abortable(conn.client.callTool({
-          name: spec.originalName,
-          arguments: normalizedParams,
-          _meta: uiSession?.requestMeta,
-        }, requestOptions), ownedSignal),
+        async (conn) => {
+          await state.manager.ensureListen?.(spec.serverName, conn);
+          return abortable(conn.client.callTool({
+            name: spec.originalName,
+            arguments: normalizedParams,
+            _meta: uiSession?.requestMeta,
+          }, requestOptions), ownedSignal);
+        },
       );
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/client").CallToolResult);
 
@@ -549,7 +553,13 @@ export function createDirectToolExecutor(
         const content = transformMcpContent(mcpContent, state.owner?.signal);
         const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
         const schemaText = spec.inputSchema ? `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}` : "";
-        const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed" });
+        const guarded = await guardMcpOutput(outputContent, {
+          ...outputGuardOptions,
+          prefix: "Error: ",
+          suffix: schemaText,
+          emptyTextFallback: "Tool execution failed",
+          ...(state.config.settings?.directToolResultDetails === "bounded" ? { rawMcpResult: result } : {}),
+        });
         return {
           content: guarded.content,
           details: { error: "tool_error", server: spec.serverName, ...guardedMcpDetails(guarded) },
@@ -560,7 +570,11 @@ export function createDirectToolExecutor(
       const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
       if (hasUi) {
         const uiSummary = summarizeUiSessionResult(uiSession);
-        const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, suffix: `\n\n${uiSummary.message}` });
+        const guarded = await guardMcpOutput(outputContent, {
+          ...outputGuardOptions,
+          suffix: `\n\n${uiSummary.message}`,
+          ...(state.config.settings?.directToolResultDetails === "bounded" ? { rawMcpResult: result } : {}),
+        });
         return {
           content: guarded.content,
           details: {
@@ -574,7 +588,10 @@ export function createDirectToolExecutor(
         };
       }
 
-      const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions });
+      const guarded = await guardMcpOutput(outputContent, {
+        ...outputGuardOptions,
+        ...(state.config.settings?.directToolResultDetails === "bounded" ? { rawMcpResult: result } : {}),
+      });
       return {
         content: guarded.content,
         details: { server: spec.serverName, tool: spec.originalName, ...guardedMcpDetails(guarded) },
@@ -599,13 +616,27 @@ export function createDirectToolExecutor(
           details: { error: "url_elicitation_required", server: spec.serverName, action },
         };
       }
+      const inputRequired = getInputRequiredNeedsUiDetails(error, spec.resourceUri
+        ? { server: spec.serverName, resourceUri: spec.resourceUri }
+        : { server: spec.serverName, tool: spec.originalName });
+      if (inputRequired) {
+        uiSession?.sendToolCancelled(inputRequired.message);
+        return {
+          content: [{ type: "text" as const, text: inputRequired.message }],
+          details: { ...inputRequired },
+        };
+      }
       const message = error instanceof Error ? error.message : String(error);
+      const aborted = isAbortError(error, ownedSignal);
+      if (!aborted) {
+        await state.manager.close(spec.serverName).catch(() => {});
+      }
       uiSession?.sendToolCancelled(message);
       const schemaText = spec.inputSchema ? `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}` : "";
       const guarded = await guardMcpOutput([{ type: "text" as const, text: message }], { ...outputGuardOptions, prefix: "Failed to call tool: ", suffix: schemaText });
       return {
         content: guarded.content,
-        details: { error: isAbortError(error, ownedSignal) ? "aborted" : "call_failed", server: spec.serverName, ...guardedMcpDetails(guarded) },
+        details: { error: aborted ? "aborted" : "call_failed", server: spec.serverName, ...guardedMcpDetails(guarded) },
       };
     } finally {
       if (uiSession?.reused) {

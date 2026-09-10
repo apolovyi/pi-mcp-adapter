@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { executeCall, executeDescribe, executeSearch } from "../proxy-modes.ts";
+import { executeCall, executeDescribe, executeList, executeSearch, executeStatus } from "../proxy-modes.ts";
 import type { McpExtensionState } from "../state.ts";
+import { buildToolMetadata } from "../tool-metadata.ts";
+import type { ServerEntry } from "../types.ts";
 
 function createState(): McpExtensionState {
   return {
@@ -31,6 +33,7 @@ function createState(): McpExtensionState {
       getConnection: () => undefined,
       isConnecting: () => false,
     },
+    serverInstructions: new Map(),
     failureTracker: new Map(),
   } as unknown as McpExtensionState;
 }
@@ -169,6 +172,83 @@ describe("proxy discovery", () => {
     expect(JSON.stringify(describeResult)).not.toContain("zzalias");
   });
 
+  it("keeps cached failed-backoff tools out of proxy discovery surfaces", () => {
+    const state = createState();
+    state.failureTracker.set("demo", Date.now());
+
+    expect(executeSearch(state, "demo").details).toMatchObject({ count: 0, matches: [] });
+    expect(executeDescribe(state, "demo_search").details).toMatchObject({ mode: "describe", error: "server_backoff", server: "demo" });
+    expect(executeList(state, "demo").details).toMatchObject({ mode: "list", error: "server_backoff", tools: [], count: 0 });
+    expect(executeStatus(state).details).toMatchObject({
+      totalTools: 0,
+      servers: [expect.objectContaining({ name: "demo", status: "failed", toolCount: 0 })],
+    });
+  });
+
+  it("does not filter needs-auth servers with stale failure entries", () => {
+    const state = createState();
+    state.failureTracker.set("demo", Date.now());
+    state.manager.getConnection = () => ({ status: "needs-auth" }) as any;
+
+    expect(executeSearch(state, "demo").details).toMatchObject({ count: 2 });
+    const list = executeList(state, "demo");
+    expect(list.details).toMatchObject({ mode: "list", count: 2 });
+    expect(list.content[0].text).toContain(
+      'demo (2 tools (needs auth — run mcp({ action: "auth-start", server: "demo" }))):',
+    );
+    expect(executeStatus(state).details).toMatchObject({
+      totalTools: 2,
+      servers: [expect.objectContaining({ name: "demo", status: "needs-auth", toolCount: 2 })],
+    });
+  });
+
+  it("explains when a lazy server's tools come from cache", () => {
+    const result = executeList(createState(), "demo");
+
+    expect(result.content[0].text).toContain(
+      'demo (2 tools (lazy: tools from cache, not connected yet — mcp({ connect: "demo" }) to connect)):',
+    );
+  });
+
+  describe.each(["global", "server"] as const)("%s toolPrefix discovery", scope => {
+    it.each([
+      ["server", "demo-mcp_search"],
+      ["short", "demo_search"],
+      ["none", "search"],
+      ["mcp", "mcp__demo-mcp_search"],
+    ] as const)("describes the exact search result with %s prefixes", (prefix, expectedName) => {
+      const state = createState();
+      const server = "demo-mcp";
+      const definition: ServerEntry = { command: "demo" };
+      const globalPrefix = scope === "global" ? prefix : "none";
+      if (scope === "server") definition.toolPrefix = prefix;
+      state.config = {
+        mcpServers: { [server]: definition },
+        settings: { toolPrefix: globalPrefix },
+      };
+      const inputSchema = { type: "object", properties: { query: { type: "string" } }, required: ["query"] };
+      const { metadata } = buildToolMetadata(
+        [{ name: "search", description: "Search demo records", inputSchema }],
+        [],
+        definition,
+        server,
+        globalPrefix,
+      );
+      state.toolMetadata = new Map([[server, metadata]]);
+
+      const search = executeSearch(state, "search", false, server);
+      expect(search.details).toMatchObject({ count: 1, matches: [{ tool: expectedName }] });
+      const matches = search.details.matches as Array<{ tool: string }>;
+      const result = executeDescribe(state, matches[0]!.tool);
+
+      expect(result.details).toMatchObject({
+        mode: "describe",
+        server,
+        tool: { name: expectedName, originalName: "search", inputSchema },
+      });
+    });
+  });
+
   it("suggests the matching tool for a prefix-mangled describe name", () => {
     const result = executeDescribe(createState(), "demo_sear");
 
@@ -266,6 +346,59 @@ describe("proxy discovery", () => {
     expect(executeDescribe(state, "demo_a_b-c").details).toMatchObject({ server: "demo", tool: { originalName: "a_b-c" } });
     await expect(executeCall(state, "demo_a-b_c", {}, "demo")).resolves.toMatchObject({ details: { server: "demo", tool: "a-b_c" } });
     expect(callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves a raw upstream name for an explicitly selected server", async () => {
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "called" }] }));
+    const state = {
+      config: { mcpServers: { codegraph: { command: "codegraph" } } },
+      toolMetadata: new Map([["codegraph", [
+        { name: "codegraph_codegraph_explore", originalName: "codegraph_explore", description: "Explore code" },
+      ]]]),
+      manager: {
+        getConnection: () => ({ status: "connected", client: { callTool } }),
+        touch: () => {},
+        incrementInFlight: () => {},
+        decrementInFlight: () => {},
+        getRequestOptions: () => undefined,
+      },
+      failureTracker: new Map(),
+      serverInstructions: new Map(),
+      completedUiSessions: [],
+    } as unknown as McpExtensionState;
+
+    const result = await executeCall(state, "codegraph_explore", { query: "identity provider" }, "codegraph");
+
+    expect(result.details).toMatchObject({ server: "codegraph", tool: "codegraph_explore" });
+    expect(result.details).not.toMatchObject({ error: "tool_not_found" });
+    expect(callTool).toHaveBeenCalledWith(
+      { name: "codegraph_explore", arguments: { query: "identity provider" }, _meta: undefined },
+      undefined,
+    );
+  });
+
+  it("fails closed for same-server normalized original-name collisions", async () => {
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "called" }] }));
+    const state = {
+      config: { mcpServers: { demo: { command: "demo" } } },
+      toolMetadata: new Map([["demo", [
+        { name: "demo_first", originalName: "search--one", description: "First" },
+        { name: "demo_second", originalName: "search-_one", description: "Second" },
+      ]]]),
+      manager: {
+        getConnection: () => ({ status: "connected", client: { callTool } }),
+        touch: () => {},
+        incrementInFlight: () => {},
+        decrementInFlight: () => {},
+        getRequestOptions: () => undefined,
+      },
+      failureTracker: new Map(),
+      serverInstructions: new Map(),
+      completedUiSessions: [],
+    } as unknown as McpExtensionState;
+
+    await expect(executeCall(state, "search__one", {}, "demo")).resolves.toMatchObject({ details: { error: "ambiguous_tool" } });
+    expect(callTool).not.toHaveBeenCalled();
   });
 
   it("tells callers to invoke native Pi tools directly", async () => {

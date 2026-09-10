@@ -79,29 +79,29 @@ export function saveMetadataCache(cache: MetadataCache): void {
   renameSync(tmpPath, cachePath);
 }
 
-export function computeServerHash(definition: ServerEntry): string {
+export function computeServerHash(definition: ServerEntry, environment: NodeJS.ProcessEnv = process.env): string {
   // Hash only fields that affect server identity and tool/resource output.
   // Exclude lifecycle, idleTimeout, requestTimeoutMs, debug — those are runtime behavior settings
   // that don't change which tools a server exposes.
   const identity: Record<string, unknown> = {
     command: definition.command,
     args: definition.args,
-    socket: resolveConfigPath(definition.socket),
-    env: interpolateEnvRecord(definition.env),
-    cwd: resolveConfigPath(definition.cwd),
-    url: resolveServerUrl(definition),
-    headers: interpolateEnvRecord(definition.headers),
+    socket: resolveConfigPath(definition.socket, environment),
+    env: interpolateEnvRecord(definition.env, environment),
+    cwd: resolveConfigPath(definition.cwd, environment),
+    url: resolveServerUrl(definition, environment),
+    headers: interpolateEnvRecord(definition.headers, environment),
     requestHeadersCommand: definition.requestHeadersCommand
       ? {
-          command: interpolateEnvVars(definition.requestHeadersCommand.command),
-          args: definition.requestHeadersCommand.args?.map(interpolateEnvVars),
-          env: interpolateEnvRecord(definition.requestHeadersCommand.env),
+          command: interpolateEnvVars(definition.requestHeadersCommand.command, environment),
+          args: definition.requestHeadersCommand.args?.map((argument) => interpolateEnvVars(argument, environment)),
+          env: interpolateEnvRecord(definition.requestHeadersCommand.env, environment),
           timeoutMs: definition.requestHeadersCommand.timeoutMs,
         }
       : undefined,
     auth: definition.auth,
     protocolVersion: definition.protocolVersion,
-    bearerToken: resolveBearerToken(definition),
+    bearerToken: resolveBearerToken(definition, environment),
     bearerTokenEnv: definition.bearerTokenEnv,
     exposeResources: definition.exposeResources,
     includeTools: definition.includeTools,
@@ -114,16 +114,24 @@ export function computeServerHash(definition: ServerEntry): string {
 export function isServerCacheValid(
   entry: ServerCacheEntry,
   definition: ServerEntry,
-  maxAgeMs: number = CACHE_MAX_AGE_MS
+  maxAgeMs: number = CACHE_MAX_AGE_MS,
+  environment: NodeJS.ProcessEnv = process.env,
 ): boolean {
   let configHash: string;
   try {
-    configHash = computeServerHash(definition);
+    configHash = computeServerHash(definition, environment);
   } catch {
     return false;
   }
   if (!entry || entry.configHash !== configHash) return false;
   if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
+  const declaredTtlMs = entry.ttlMs;
+  if (typeof declaredTtlMs === "number" && Number.isSafeInteger(declaredTtlMs) && declaredTtlMs >= 0) {
+    if (declaredTtlMs === 0) return false;
+    const ageMs = Date.now() - entry.cachedAt;
+    const effectiveMaxAge = maxAgeMs > 0 ? Math.min(maxAgeMs, declaredTtlMs) : declaredTtlMs;
+    return ageMs < effectiveMaxAge;
+  }
   if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return false;
   return true;
 }
@@ -223,6 +231,7 @@ export function reconstructToolMetadata(
       originalName: tool.name,
       description: tool.description ?? "",
       ...(tool.inputSchema !== undefined ? { inputSchema: tool.inputSchema } : {}),
+      ...(tool.outputSchema !== undefined ? { outputSchema: tool.outputSchema } : {}),
       ...(tool.uiResourceUri !== undefined ? { uiResourceUri: tool.uiResourceUri } : {}),
       ...(tool.uiVisibility !== undefined ? { uiVisibility: tool.uiVisibility } : {}),
       ...(tool.uiStreamMode !== undefined ? { uiStreamMode: tool.uiStreamMode } : {}),
@@ -290,6 +299,7 @@ export function serializeTools(tools: McpTool[]): CachedTool[] {
         name: t.name,
         ...(t.description !== undefined ? { description: t.description } : {}),
         ...(t.inputSchema !== undefined ? { inputSchema: t.inputSchema } : {}),
+        ...(t.outputSchema !== undefined ? { outputSchema: t.outputSchema } : {}),
         ...(uiResourceUri !== undefined ? { uiResourceUri } : {}),
         ...(uiVisibility !== undefined ? { uiVisibility } : {}),
         ...(uiStreamMode !== undefined ? { uiStreamMode } : {}),

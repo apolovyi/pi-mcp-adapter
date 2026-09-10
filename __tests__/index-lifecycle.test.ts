@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolve } from "node:path";
 import { MCP_STATUS_EVENT } from "../types.ts";
+import { ConsentManager } from "../consent-manager.ts";
+import { MCP_APPROVAL_CUSTOM_TYPE, getToolApprovalIdentity, makeToolApprovalKey } from "../session-approvals.ts";
 
 const mocks = vi.hoisted(() => ({
   initializeMcp: vi.fn(),
@@ -11,9 +14,12 @@ const mocks = vi.hoisted(() => ({
   shutdownOAuth: vi.fn().mockResolvedValue(undefined),
   loadMcpConfig: vi.fn(() => ({ mcpServers: {} })),
   cloneMcpConfig: vi.fn((config: unknown) => structuredClone(config)),
+  discoverConfiguredClaudePluginSkills: vi.fn(() => []),
+  resolveConfiguredClaudePluginMcp: vi.fn((config: unknown) => structuredClone(config)),
   loadMetadataCache: vi.fn(() => null),
   buildProxyDescription: vi.fn(() => "MCP gateway"),
   createDirectToolExecutor: vi.fn(() => vi.fn()),
+  prepareDirectToolArguments: vi.fn((_schema: unknown, args: unknown) => args),
   getMissingConfiguredDirectToolServers: vi.fn(() => []),
   resolveDirectTools: vi.fn(() => []),
   showStatus: vi.fn(),
@@ -59,10 +65,13 @@ vi.mock("../mcp-auth-flow.ts", () => ({
 vi.mock("../config.ts", () => ({
   loadMcpConfig: mocks.loadMcpConfig,
   cloneMcpConfig: mocks.cloneMcpConfig,
+  discoverConfiguredClaudePluginSkills: mocks.discoverConfiguredClaudePluginSkills,
+  resolveConfiguredClaudePluginMcp: mocks.resolveConfiguredClaudePluginMcp,
   writeProjectServerDisabledOverride: mocks.writeProjectServerDisabledOverride,
 }));
 
-vi.mock("../metadata-cache.ts", () => ({
+vi.mock("../metadata-cache.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../metadata-cache.ts")>()),
   loadMetadataCache: mocks.loadMetadataCache,
 }));
 
@@ -70,6 +79,7 @@ vi.mock("../direct-tools.ts", () => ({
   buildProxyDescription: mocks.buildProxyDescription,
   createDirectToolExecutor: mocks.createDirectToolExecutor,
   getMissingConfiguredDirectToolServers: mocks.getMissingConfiguredDirectToolServers,
+  prepareDirectToolArguments: mocks.prepareDirectToolArguments,
   resolveDirectTools: mocks.resolveDirectTools,
 }));
 
@@ -101,27 +111,35 @@ vi.mock("../proxy-modes.ts", () => ({
 vi.mock("../utils.ts", () => ({
   formatTerminalError: (error: unknown) => error instanceof Error ? error.message : String(error),
   getConfigPathFromArgv: mocks.getConfigPathFromArgv,
+  interpolateEnvRecord: (value: Record<string, string> | undefined) => value,
+  interpolateEnvVars: (value: string | undefined) => value,
   normalizeDirectToolInputSchema: mocks.normalizeDirectToolInputSchema,
+  resolveBearerToken: (definition: { bearerToken?: string }) => definition.bearerToken,
+  resolveConfigPath: (value: string | undefined) => value,
+  resolveServerUrl: (definition: { url?: string }) => definition.url,
   sanitizeTerminalText: (text: string) => text,
   truncateAtWord: mocks.truncateAtWord,
 }));
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function createState() {
   return {
-    manager: { getAllConnections: () => new Map() },
+    manager: { getAllConnections: () => new Map(), getConnection: vi.fn(() => undefined) },
     lifecycle: {
       gracefulShutdown: vi.fn().mockResolvedValue(undefined),
       ensureConverged: vi.fn().mockResolvedValue(undefined),
     },
     toolMetadata: new Map(),
+    directToolCounts: new Map(),
     config: { mcpServers: {} },
     oauthRuntime: { signal: new AbortController().signal },
     failureTracker: new Map(),
@@ -150,6 +168,7 @@ function createPi(options: { unregisterTool?: false | ((name: string) => boolean
       on: vi.fn((event: string, handler: (...args: any[]) => unknown) => {
         handlers.set(event, handler);
       }),
+      events: { on: vi.fn(), emit: vi.fn() },
       getAllTools: vi.fn(() => []),
       getActiveTools: vi.fn(() => activeTools),
       setActiveTools: vi.fn((nextActiveTools: string[]) => {
@@ -177,6 +196,7 @@ function createStatusObservingPi() {
     activeTools = [...nextActiveTools];
   });
   api.events = {
+    on: vi.fn(),
     emit: vi.fn((channel: string, payload: { connectedCount?: number }) => {
       if (channel !== MCP_STATUS_EVENT || payload.connectedCount !== 1) return;
       connectedSurfaces.push(activeTools
@@ -205,6 +225,28 @@ function connectedStatusSnapshot(toolCount: number) {
   };
 }
 
+// Models Pi's runtime tool registry: registering a name for the first time
+// appends it to the active set, re-registering a known name does not, and
+// unregisterTool (when the host has it) forgets the name again.
+function trackRuntimeToolActivation(api: any, initialActiveTools: string[]): () => string[] {
+  const registry = new Set(initialActiveTools);
+  let activeTools = [...initialActiveTools];
+  api.registerTool.mockImplementation((tool: { name: string }) => {
+    if (registry.has(tool.name)) return;
+    registry.add(tool.name);
+    activeTools.push(tool.name);
+  });
+  api.unregisterTool?.mockImplementation((toolName: string) => {
+    activeTools = activeTools.filter((name) => name !== toolName);
+    return registry.delete(toolName);
+  });
+  api.getActiveTools.mockImplementation(() => [...activeTools]);
+  api.setActiveTools.mockImplementation((nextActiveTools: string[]) => {
+    activeTools = [...nextActiveTools];
+  });
+  return () => [...activeTools];
+}
+
 describe("mcpAdapter session lifecycle", () => {
   const originalDirectTools = process.env.MCP_DIRECT_TOOLS;
 
@@ -223,9 +265,17 @@ describe("mcpAdapter session lifecycle", () => {
     mocks.shutdownOAuth.mockResolvedValue(undefined);
     mocks.loadMcpConfig.mockReturnValue({ mcpServers: {} });
     mocks.cloneMcpConfig.mockImplementation((config: unknown) => structuredClone(config));
+    mocks.discoverConfiguredClaudePluginSkills.mockReturnValue([]);
+    mocks.resolveConfiguredClaudePluginMcp.mockImplementation((config: unknown) => structuredClone(config));
     mocks.loadMetadataCache.mockReturnValue(null);
     mocks.buildProxyDescription.mockReturnValue("MCP gateway");
     mocks.createDirectToolExecutor.mockReturnValue(vi.fn());
+    mocks.prepareDirectToolArguments.mockImplementation((_schema: unknown, args: unknown) => {
+      const input = args as { filter?: unknown };
+      return typeof input.filter === "string"
+        ? { ...input, filter: JSON.parse(input.filter) }
+        : args;
+    });
     mocks.getMissingConfiguredDirectToolServers.mockReturnValue([]);
     mocks.resolveDirectTools.mockReturnValue([]);
     mocks.getConfigPathFromArgv.mockReturnValue(undefined);
@@ -252,6 +302,25 @@ describe("mcpAdapter session lifecycle", () => {
     expect(commandNames.filter((name: string) => name === "mcp")).toHaveLength(1);
     expect(commandNames.filter((name: string) => name === "pi-mcp")).toHaveLength(1);
     expect(commandNames.filter((name: string) => name === "mcp-auth")).toHaveLength(1);
+  });
+
+  it("discovers configured Claude plugin skills on startup and reload", async () => {
+    let generation = 0;
+    mocks.loadMcpConfig.mockImplementation(() => ({
+      mcpServers: {},
+      claudePlugins: [{ path: `plugin-${++generation}`, skills: true }],
+    }));
+    mocks.discoverConfiguredClaudePluginSkills.mockImplementation((config: { claudePlugins?: Array<{ path: string }> }) =>
+      config.claudePlugins?.map(plugin => `/skills/${plugin.path}`) ?? []);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    const discover = handlers.get("resources_discover")!;
+
+    expect(discover({ cwd: "/project", reason: "initial" })).toEqual({ skillPaths: ["/skills/plugin-2"] });
+    expect(discover({ cwd: "/project", reason: "reload" })).toEqual({ skillPaths: ["/skills/plugin-3"] });
+    expect(mocks.discoverConfiguredClaudePluginSkills).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the proxy tool when direct tools are still missing from cache", async () => {
@@ -476,6 +545,75 @@ describe("mcpAdapter session lifecycle", () => {
     expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "demo_search" }));
   });
 
+  it("restores approval state from the active session branch on session_tree", async () => {
+    const sessionManager = {
+      getBranch: vi.fn(),
+    };
+    const state = createState();
+    const tool = {
+      originalName: "search",
+      inputSchema: { type: "object", properties: { query: { type: "string" } } },
+      uiResourceUri: "ui://demo/search",
+    };
+    const identity = getToolApprovalIdentity("demo", tool, { query: "safe" });
+    const branch = [{
+      type: "custom",
+      customType: MCP_APPROVAL_CUSTOM_TYPE,
+      data: {
+        version: 1,
+        kind: "tool",
+        decision: "allow_for_session",
+        serverName: "demo",
+        originalToolName: "search",
+        definitionHash: identity.definitionHash,
+        argsHash: identity.argsHash,
+      },
+    }];
+    sessionManager.getBranch.mockReturnValue(branch);
+    state.sessionManager = sessionManager;
+    state.approvedToolCalls = new Map([["stale", true]]);
+    state.consentManager = new ConsentManager();
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    const context = { hasUI: false, sessionManager };
+    await handlers.get("session_start")?.({}, context);
+    await handlers.get("session_tree")?.({}, context);
+
+    expect(state.approvedToolCalls).toEqual(new Map([
+      [makeToolApprovalKey("demo", "search", identity.definitionHash, identity.argsHash), true],
+    ]));
+  });
+
+  it("ignores session_tree events from a stale session manager", async () => {
+    const activeSessionManager = { getBranch: vi.fn().mockReturnValue([]) };
+    const staleSessionManager = { getBranch: vi.fn().mockReturnValue([{
+      type: "custom",
+      customType: MCP_APPROVAL_CUSTOM_TYPE,
+      data: {
+        version: 1,
+        kind: "iframe",
+        decision: "allow",
+        serverName: "stale",
+      },
+    }]) };
+    const state = createState();
+    state.sessionManager = activeSessionManager;
+    state.consentManager = new ConsentManager();
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, { hasUI: false, sessionManager: activeSessionManager });
+    await handlers.get("session_tree")?.({}, { hasUI: false, sessionManager: staleSessionManager });
+
+    expect(staleSessionManager.getBranch).not.toHaveBeenCalled();
+    expect(state.consentManager.requiresPrompt("stale")).toBe(true);
+  });
+
   it("waits for keep-alive convergence before Pi processes the next input", async () => {
     const config = {
       mcpServers: {
@@ -641,6 +779,13 @@ describe("mcpAdapter session lifecycle", () => {
           prefixedName: "demo_search",
           description: "Search demo",
         },
+        {
+          serverName: "demo",
+          originalName: "read_doc",
+          prefixedName: "demo_read_doc",
+          description: "Read demo document",
+          resourceUri: "mcp://demo/doc",
+        },
       ]);
     mocks.initializeMcp.mockResolvedValue(state);
 
@@ -656,6 +801,401 @@ describe("mcpAdapter session lifecycle", () => {
     await Promise.resolve();
 
     expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "demo_search" }));
+    expect(state.directToolCounts).toEqual(new Map([["demo", 2]]));
+  });
+
+  it("does not refresh frozen direct tools on failure-backoff metadata updates", async () => {
+    const config = {
+      settings: { freezeDirectTools: true },
+      mcpServers: {
+        demo: { command: "npx", args: ["-y", "demo-server"], directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools.mockReturnValue([
+      {
+        serverName: "demo",
+        originalName: "search",
+        prefixedName: "demo_search",
+        description: "Search demo",
+      },
+    ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const callsAfterInitialSync = mocks.resolveDirectTools.mock.calls.length;
+    state.onToolMetadataUpdated?.("demo", "failure-backoff-started");
+
+    expect(mocks.resolveDirectTools).toHaveBeenCalledTimes(callsAfterInitialSync);
+  });
+
+  it("does not mutate frozen direct tools on explicit proxy connect or slash reconnect", async () => {
+    const config = {
+      settings: { freezeDirectTools: true },
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools.mockReturnValue([{
+      serverName: "demo",
+      originalName: "search",
+      prefixedName: "demo_search",
+      description: "Search demo",
+    }]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const connectResult = { content: [{ type: "text", text: "connected" }] };
+    mocks.executeConnect.mockResolvedValue(connectResult);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const callsAfterInitialSync = mocks.resolveDirectTools.mock.calls.length;
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    expect(await proxyTool.execute("call-1", { connect: "demo" })).toBe(connectResult);
+    const commandDef = api.registerCommand.mock.calls.find((call: any[]) => call[0] === "mcp")?.[1];
+    await commandDef.handler("reconnect demo", { hasUI: false });
+
+    expect(mocks.executeConnect).toHaveBeenCalledWith(state, "demo", undefined);
+    expect(mocks.reconnectServers).toHaveBeenCalledWith(state, expect.any(Object), "demo");
+    expect(mocks.resolveDirectTools).toHaveBeenCalledTimes(callsAfterInitialSync);
+  });
+
+  it("reports direct tools discovered by proxy connect as addedToolNames without rewriting active tools", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce([])
+      .mockReturnValue([
+        { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" },
+        { serverName: "demo", originalName: "read", prefixedName: "demo_read", description: "Read demo" },
+      ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const connectResult = { content: [{ type: "text", text: "connected" }], details: { mode: "connect" } };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      // A live connect refreshes metadata, which syncs the tool surface before executeConnect returns.
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    const activeTools = trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+    const activeBeforeConnect = activeTools();
+
+    const result = await proxyTool.execute("call-1", { connect: "demo" });
+
+    expect(result).toMatchObject({ content: connectResult.content, details: connectResult.details });
+    expect(result.addedToolNames).toEqual(["demo_search", "demo_read"]);
+    expect(activeTools()).toEqual([...activeBeforeConnect, "demo_search", "demo_read"]);
+    expect(api.setActiveTools).not.toHaveBeenCalled();
+  });
+
+  it("returns the proxy connect result untouched when no direct tools were added", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools.mockReturnValue([
+      { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" },
+    ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const connectResult = { content: [{ type: "text", text: "connected" }] };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    expect(await proxyTool.execute("call-1", { connect: "demo" })).toBe(connectResult);
+    expect(api.setActiveTools).not.toHaveBeenCalled();
+  });
+
+  it("attributes only the connected server's direct tools when another server registers during the connect", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+        other: { command: "other", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce([])
+      .mockReturnValue([
+        { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" },
+        { serverName: "other", originalName: "list", prefixedName: "other_list", description: "List other" },
+      ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const connectResult = { content: [{ type: "text", text: "connected" }], details: { mode: "connect" } };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      // Another server's metadata refresh lands while this connect is in flight.
+      currentState.onToolMetadataUpdated?.("other", "list-changed");
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    const result = await proxyTool.execute("call-1", { connect: "demo" });
+
+    expect(result.addedToolNames).toEqual(["demo_search"]);
+    expect(api.setActiveTools).not.toHaveBeenCalled();
+  });
+
+  it("reports same-server overlapping connect discovery only once", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce([])
+      .mockReturnValue([
+        { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" },
+      ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const firstStarted = createDeferred<void>();
+    const secondStarted = createDeferred<void>();
+    const discovery = createDeferred<void>();
+    let connectCount = 0;
+    const connectResult = { content: [{ type: "text", text: "connected" }] };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      const started = connectCount++ === 0 ? firstStarted : secondStarted;
+      started.resolve();
+      await discovery.promise;
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    const firstConnect = proxyTool.execute("call-1", { connect: "demo" });
+    await firstStarted.promise;
+    const secondConnect = proxyTool.execute("call-2", { connect: "demo" });
+    await secondStarted.promise;
+    discovery.resolve();
+
+    const [firstResult, secondResult] = await Promise.all([firstConnect, secondConnect]);
+
+    expect(firstResult.addedToolNames).toEqual(["demo_search"]);
+    expect(secondResult).not.toHaveProperty("addedToolNames");
+  });
+
+  it("reports same-server overlapping connect reactivation only once", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const search = { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" };
+    const restoredSearch = { ...search, description: "Search demo restored" };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([search])
+      .mockReturnValueOnce([search])
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce([restoredSearch])
+      .mockReturnValue([restoredSearch]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const firstStarted = createDeferred<void>();
+    const secondStarted = createDeferred<void>();
+    const discovery = createDeferred<void>();
+    let connectCount = 0;
+    const connectResult = { content: [{ type: "text", text: "connected" }] };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      const started = connectCount++ === 0 ? firstStarted : secondStarted;
+      started.resolve();
+      await discovery.promise;
+      if (connectCount === 2) {
+        currentState.onToolMetadataUpdated?.("demo", "list-changed");
+        currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      }
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi({ unregisterTool: false });
+    trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    const firstConnect = proxyTool.execute("call-1", { connect: "demo" });
+    await firstStarted.promise;
+    const secondConnect = proxyTool.execute("call-2", { connect: "demo" });
+    await secondStarted.promise;
+    discovery.resolve();
+
+    const results = await Promise.all([firstConnect, secondConnect]);
+
+    expect(results.map((result) => result.addedToolNames).filter(Boolean)).toEqual([["demo_search"]]);
+  });
+
+  it("keeps stale direct tools out of addedToolNames and deactivates them explicitly without unregisterTool", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const search = { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" };
+    const lookup = { serverName: "demo", originalName: "lookup", prefixedName: "demo_lookup", description: "Lookup demo" };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([search])
+      .mockReturnValueOnce([search])
+      .mockReturnValueOnce([lookup])
+      .mockReturnValueOnce([lookup])
+      .mockReturnValue([search]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return { content: [{ type: "text", text: "connected" }] };
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi({ unregisterTool: false });
+    const activeTools = trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const activeBeforeConnect = activeTools();
+    expect(activeBeforeConnect).toContain("demo_search");
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    // Metadata replaced demo_search with demo_lookup: the removal is an explicit
+    // active-set rewrite, the addition rides on the result.
+    const replaced = await proxyTool.execute("call-1", { connect: "demo" });
+    const activeAfterReplace = [...activeBeforeConnect.filter((name) => name !== "demo_search"), "demo_lookup"];
+    expect(api.unregisterTool).toBeUndefined();
+    expect(replaced.addedToolNames).toEqual(["demo_lookup"]);
+    expect(api.setActiveTools).toHaveBeenCalledWith(activeAfterReplace);
+    expect(activeTools()).toEqual(activeAfterReplace);
+
+    // demo_search comes back: Pi does not re-activate a name it already knows,
+    // so the adapter re-adds it and reports it on this result too.
+    const restored = await proxyTool.execute("call-2", { connect: "demo" });
+    expect(restored.addedToolNames).toEqual(["demo_search"]);
+    expect(activeTools()).toEqual([...activeAfterReplace.filter((name) => name !== "demo_lookup"), "demo_search"]);
+  });
+
+  it("keeps hidden direct tool names reserved against namespace proxies during backoff", async () => {
+    const { computeServerHash } = await import("../metadata-cache.ts");
+    const failedDefinition = { command: "failed", directTools: true };
+    const proxyDefinition = { command: "foo" };
+    const config = {
+      settings: { toolPrefix: "mcp" },
+      mcpServers: {
+        failed: failedDefinition,
+        foo: proxyDefinition,
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.loadMetadataCache.mockReturnValue({
+      version: 1,
+      servers: {
+        foo: {
+          configHash: computeServerHash(proxyDefinition),
+          cachedAt: Date.now(),
+          tools: [{ name: "run" }],
+          resources: [],
+        },
+      },
+    });
+    mocks.resolveDirectTools.mockImplementation((_config, _cache, _prefix, _env, unavailableServers, reservedNames) => {
+      reservedNames?.add("mcp__foo");
+      if (unavailableServers?.has("failed")) {
+        return [];
+      }
+      return [{
+        serverName: "failed",
+        originalName: "foo",
+        prefixedName: "mcp__foo",
+        description: "Failed direct",
+      }];
+    });
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    state.failureTracker.set("failed", Date.now());
+    state.onToolMetadataUpdated?.("failed", "failure-backoff-started");
+
+    expect(state.directToolCounts).toEqual(new Map());
+    expect(api.registerTool).not.toHaveBeenCalledWith(expect.objectContaining({
+      name: "mcp__foo",
+      description: expect.stringContaining("Namespace-proxy"),
+    }));
   });
 
   it("publishes connected status only after replacing stale cached direct tools", async () => {
@@ -901,7 +1441,7 @@ describe("mcpAdapter session lifecycle", () => {
     );
   });
 
-  it("dispatches gateway params nested inside proxy args", async () => {
+  it("rejects gateway params nested inside proxy args", async () => {
     const state = createState();
     mocks.initializeMcp.mockResolvedValue(state);
     mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
@@ -917,18 +1457,15 @@ describe("mcpAdapter session lifecycle", () => {
     await Promise.resolve();
 
     const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
-    await proxyTool.execute("call-1", { args: '{"search":"screenshot","limit":3}' });
-    await proxyTool.execute("call-2", { args: { tool: "demo_search", args: { q: "hello" }, server: "demo" } });
-
-    expect(mocks.executeSearch).toHaveBeenCalledWith(state, "screenshot", undefined, undefined, undefined, 3, undefined);
-    expect(mocks.executeCall).toHaveBeenCalledWith(
-      state,
-      "demo_search",
-      { q: "hello" },
-      "demo",
-      expect.any(Function),
-      undefined,
+    await expect(proxyTool.execute("call-1", { args: '{"search":"screenshot","limit":3}' })).rejects.toThrow(
+      "Gateway params were nested inside `args`; pass them top-level",
     );
+    await expect(proxyTool.execute("call-2", { args: { tool: "demo_search", args: { q: "hello" }, server: "demo" } })).rejects.toThrow(
+      "Gateway params were nested inside `args`; pass them top-level",
+    );
+
+    expect(mocks.executeSearch).not.toHaveBeenCalled();
+    expect(mocks.executeCall).not.toHaveBeenCalled();
     expect(mocks.executeStatus).not.toHaveBeenCalled();
   });
 
@@ -949,27 +1486,10 @@ describe("mcpAdapter session lifecycle", () => {
     await expect(proxyTool.execute("call-1", { args: '{"query":"screenshot"}' })).rejects.toThrow(
       "Gateway params were nested inside `args`; pass them top-level",
     );
-    expect(mocks.executeStatus).not.toHaveBeenCalled();
-  });
-
-  it("rejects invalid nested gateway param types before dispatch", async () => {
-    const state = createState();
-    mocks.initializeMcp.mockResolvedValue(state);
-
-    const { default: mcpAdapter } = await import("../index.ts");
-    const { api, handlers } = createPi();
-    mcpAdapter(api);
-
-    const sessionStart = handlers.get("session_start");
-    await sessionStart?.({}, {});
-    await Promise.resolve();
-    await Promise.resolve();
-
-    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
-    await expect(proxyTool.execute("call-1", { args: { search: 5 } })).rejects.toThrow(
-      "Invalid nested gateway param `search`: expected string, got number",
+    await expect(proxyTool.execute("call-2", { args: "" })).rejects.toThrow(
+      "Gateway params were nested inside `args`; pass them top-level",
     );
-    expect(mocks.executeSearch).not.toHaveBeenCalled();
+    expect(mocks.executeStatus).not.toHaveBeenCalled();
   });
 
   it("routes manual auth actions through the proxy tool", async () => {
@@ -1078,6 +1598,8 @@ describe("mcpAdapter session lifecycle", () => {
       null,
       "server",
       undefined,
+      expect.any(Set),
+      expect.any(Set),
     );
     expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "memory_search" }));
     expect(api.registerTool).not.toHaveBeenCalledWith(expect.objectContaining({ name: "mcp" }));
@@ -1090,6 +1612,84 @@ describe("mcpAdapter session lifecycle", () => {
       expect.objectContaining({ config: expect.objectContaining({ mcpServers: config.mcpServers }) }),
     );
     expect(mocks.initializeMcp.mock.calls[0][3].config).not.toBe(config);
+  });
+
+  it("keeps programmatic relative Claude plugin paths stable when the session cwd differs", async () => {
+    const processCwd = "/process-project";
+    const sessionCwd = "/active-project";
+    vi.spyOn(process, "cwd").mockReturnValue(processCwd);
+    const config = {
+      mcpServers: {},
+      claudePlugins: [{ path: "./plugins/local", mcp: true, skills: true }],
+    };
+    const state = createState();
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { createMcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    createMcpAdapter({ config })(api);
+
+    const expectedPath = resolve(processCwd, "./plugins/local");
+    expect(mocks.resolveConfiguredClaudePluginMcp.mock.calls[0]?.[0]).toEqual({
+      mcpServers: {},
+      claudePlugins: [{ path: expectedPath, mcp: true, skills: true }],
+    });
+
+    await handlers.get("session_start")?.({}, { hasUI: false, mode: "print", cwd: sessionCwd });
+    await Promise.resolve();
+    const runtimeConfig = mocks.initializeMcp.mock.calls[0]?.[3].config;
+    expect(runtimeConfig.claudePlugins[0].path).toBe(expectedPath);
+    expect(mocks.initializeMcp.mock.calls[0]?.[1].cwd).toBe(sessionCwd);
+
+    const discover = handlers.get("resources_discover")!;
+    discover({ cwd: sessionCwd, reason: "reload" });
+    expect(mocks.discoverConfiguredClaudePluginSkills.mock.calls[0]?.[0].claudePlugins[0].path).toBe(expectedPath);
+    expect(mocks.discoverConfiguredClaudePluginSkills.mock.calls[0]?.[1]).toBe(sessionCwd);
+  });
+
+  it("adds strict direct-tool argument preparation only when configured", async () => {
+    const inputSchema = {
+      type: "object",
+      required: ["filter"],
+      properties: {
+        filter: {
+          type: "object",
+          required: ["site"],
+          properties: { site: { type: "string" } },
+        },
+      },
+    };
+    mocks.resolveDirectTools.mockReturnValue([{
+      serverName: "memory",
+      originalName: "search",
+      prefixedName: "memory_search",
+      description: "Search",
+      inputSchema,
+    }]);
+    const { createMcpAdapter } = await import("../index.ts");
+    const strictPi = createPi();
+    createMcpAdapter({
+      config: {
+        mcpServers: { memory: { command: "memory", directTools: true } },
+        settings: { strictDirectToolArguments: true },
+      },
+    })(strictPi.api);
+    const strictTool = strictPi.api.registerTool.mock.calls.find(
+      ([tool]: [Record<string, unknown>]) => tool.name === "memory_search",
+    )?.[0];
+
+    expect(strictTool.prepareArguments({ filter: '{"site":"north"}' })).toEqual({
+      filter: { site: "north" },
+    });
+
+    const leanPi = createPi();
+    createMcpAdapter({
+      config: { mcpServers: { memory: { command: "memory", directTools: true } } },
+    })(leanPi.api);
+    const leanTool = leanPi.api.registerTool.mock.calls.find(
+      ([tool]: [Record<string, unknown>]) => tool.name === "memory_search",
+    )?.[0];
+    expect(leanTool).not.toHaveProperty("prepareArguments");
   });
 
   it("snapshots caller config and isolates separate factories", async () => {
@@ -1396,6 +1996,84 @@ describe("mcpAdapter session lifecycle", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("retries initialization from the proxy tool after an initialization failure", async () => {
+    const state = createState();
+    mocks.initializeMcp
+      .mockRejectedValueOnce(new Error("first boom"))
+      .mockResolvedValueOnce(state);
+    mocks.executeSearch.mockResolvedValue({ content: [{ type: "text", text: "results" }] });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const { default: mcpAdapter } = await import("../index.ts");
+      const { api, handlers } = createPi();
+      mcpAdapter(api);
+
+      await handlers.get("session_start")?.({}, { hasUI: false });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+      const callCtx = { hasUI: false, cwd: "/tmp/retry", mode: "print" };
+      const result = await proxyTool.execute("call-1", { search: "demo" }, undefined, undefined, callCtx);
+
+      expect(mocks.initializeMcp).toHaveBeenCalledTimes(2);
+      expect(mocks.initializeMcp.mock.calls[1][1]).toBe(callCtx);
+      expect(result).toEqual({ content: [{ type: "text", text: "results" }] });
+      expect(mocks.executeSearch).toHaveBeenCalledWith(state, "demo", undefined, undefined, undefined, undefined, undefined);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("returns retry guidance when proxy retry initialization also fails", async () => {
+    mocks.initializeMcp
+      .mockRejectedValueOnce(new Error("first boom"))
+      .mockRejectedValueOnce(new Error("retry boom"));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const { default: mcpAdapter } = await import("../index.ts");
+      const { api, handlers } = createPi();
+      mcpAdapter(api);
+
+      await handlers.get("session_start")?.({}, { hasUI: false });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+      const result = await proxyTool.execute("call-1", { search: "demo" }, undefined, undefined, { hasUI: false });
+      const text = result.content[0].text;
+
+      expect(mocks.initializeMcp).toHaveBeenCalledTimes(2);
+      expect(text).not.toBe("MCP not initialized");
+      expect(text).toContain("retry boom");
+      expect(text).toContain("call mcp(...) again to retry initialization");
+      expect(result.details).toEqual({ error: "init_failed", message: "retry boom" });
+      expect(mocks.executeSearch).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("does not turn a shutdown-aborted initialization into retry guidance", async () => {
+    const initializing = createDeferred<any>();
+    mocks.initializeMcp.mockReturnValue(initializing.promise);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+
+    await handlers.get("session_start")?.({}, { hasUI: false });
+
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+    const resultPromise = proxyTool.execute("call-1", { search: "demo" }, undefined, undefined, { hasUI: false });
+
+    await handlers.get("session_shutdown")?.();
+    initializing.reject(new Error("network down"));
+
+    await expect(resultPromise).rejects.toThrow("network down");
+    expect(mocks.executeSearch).not.toHaveBeenCalled();
   });
 
   it("shuts down OAuth on session_shutdown", async () => {
@@ -1757,11 +2435,13 @@ describe("mcpAdapter session lifecycle", () => {
     const toolResult = handlers.get("tool_result");
     expect(toolResult).toBeDefined();
 
-    // server returned an error result (direct path) -> tagged tool_error
     expect(toolResult?.({ details: { error: "tool_error", server: "demo" } })).toEqual({ isError: true });
-    // the call itself threw and was caught (proxy path) -> tagged call_failed
     expect(toolResult?.({ details: { mode: "call", error: "call_failed", message: "boom" } })).toEqual({ isError: true });
-    // a precondition code is not a tool-execution failure -> left untouched
+    expect(toolResult?.({ details: { mode: "call", error: "input_required_needs_ui", server: "demo" } })).toEqual({ isError: true });
+    expect(toolResult?.({ details: { mode: "script", error: "script_error" } })).toEqual({ isError: true });
+    expect(toolResult?.({
+      details: { mode: "script", calls: [{ path: "demo_needs_ui", ok: false, error: "input_required_needs_ui" }] },
+    })).toBeUndefined();
     expect(toolResult?.({ details: { error: "auth_required", server: "demo" } })).toBeUndefined();
   });
 });

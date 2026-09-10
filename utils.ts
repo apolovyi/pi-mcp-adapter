@@ -64,25 +64,44 @@ export async function parallelLimit<T, R>(
 }
 
 export function getConfigPathFromArgv(): string | undefined {
-  const idx = process.argv.indexOf("--mcp-config");
-  if (idx >= 0 && idx + 1 < process.argv.length) {
-    return process.argv[idx + 1];
+  let configPath: string | undefined;
+  for (let index = 2; index < process.argv.length; index++) {
+    const arg = process.argv[index];
+    if (arg === undefined) continue;
+    if (arg === "--") break;
+
+    if (arg === "--mcp-config") {
+      const value = process.argv[index + 1];
+      if (value !== undefined && !value.startsWith("-") && !value.startsWith("@")) {
+        configPath = value;
+        index++;
+      } else {
+        configPath = undefined;
+      }
+      continue;
+    }
+
+    if (arg.startsWith("--mcp-config=")) {
+      configPath = arg.slice("--mcp-config=".length);
+    }
   }
-  return undefined;
+  return configPath;
 }
 
-export function interpolateEnvVars(value: string): string {
+export function interpolateEnvVars(value: string): string;
+export function interpolateEnvVars(value: string, environment: NodeJS.ProcessEnv): string;
+export function interpolateEnvVars(value: string, environment: NodeJS.ProcessEnv = process.env): string {
   return value
-    .replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] ?? "")
-    .replace(/\$env:(\w+)/g, (_, name) => process.env[name] ?? "")
-    .replace(/\{env:(\w+)\}/g, (_, name) => process.env[name] ?? "");
+    .replace(/\$\{(\w+)\}/g, (_, name) => environment[name] ?? "")
+    .replace(/\$env:(\w+)/g, (_, name) => environment[name] ?? "")
+    .replace(/\{env:(\w+)\}/g, (_, name) => environment[name] ?? "");
 }
 
-function getMissingEnvVars(value: string): string[] {
+export function getMissingEnvVars(value: string, environment: NodeJS.ProcessEnv = process.env): string[] {
   const missing = new Set<string>();
   for (const match of value.matchAll(/\$\{(\w+)\}|\$env:(\w+)|\{env:(\w+)\}/g)) {
     const name = match[1] ?? match[2] ?? match[3];
-    if (name && process.env[name] === undefined) {
+    if (name && environment[name] === undefined) {
       missing.add(name);
     }
   }
@@ -99,17 +118,17 @@ export function toStringRecord(value: unknown): Record<string, string> | undefin
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-function interpolateSecretExpression(value: string): string {
-  if (value.startsWith("!!")) return interpolateEnvVars(value.slice(1));
-  return value.startsWith("!") ? value : interpolateEnvVars(value);
+function interpolateSecretExpression(value: string, environment: NodeJS.ProcessEnv): string {
+  if (value.startsWith("!!")) return interpolateEnvVars(value.slice(1), environment);
+  return value.startsWith("!") ? value : interpolateEnvVars(value, environment);
 }
 
-export function interpolateEnvRecord(values: Record<string, string> | undefined): Record<string, string> | undefined {
+export function interpolateEnvRecord(values: Record<string, string> | undefined, environment: NodeJS.ProcessEnv = process.env): Record<string, string> | undefined {
   if (!values) return undefined;
 
   return Object.fromEntries(Object.entries(values).map(([key, value]) => [
     key,
-    interpolateSecretExpression(value),
+    interpolateSecretExpression(value, environment),
   ]));
 }
 
@@ -164,18 +183,18 @@ export function resolveCommandSecretsRecord(
   ]));
 }
 
-export function resolveServerUrl(definition: Pick<ServerEntry, "url">): string | undefined {
+export function resolveServerUrl(definition: Pick<ServerEntry, "url">, environment: NodeJS.ProcessEnv = process.env): string | undefined {
   if (definition.url == null) return undefined;
   if (typeof definition.url !== "string") {
     throw new Error("MCP server URL must be a string");
   }
 
-  const missing = getMissingEnvVars(definition.url);
+  const missing = getMissingEnvVars(definition.url, environment);
   if (missing.length > 0) {
     throw new Error(`Missing environment variable${missing.length === 1 ? "" : "s"} in MCP server URL: ${missing.join(", ")}`);
   }
 
-  const resolved = interpolateEnvVars(definition.url);
+  const resolved = interpolateEnvVars(definition.url, environment);
   try {
     new URL(resolved);
   } catch (error) {
@@ -184,10 +203,10 @@ export function resolveServerUrl(definition: Pick<ServerEntry, "url">): string |
   return resolved;
 }
 
-export function resolveConfigPath(value: string | undefined): string | undefined {
+export function resolveConfigPath(value: string | undefined, environment: NodeJS.ProcessEnv = process.env): string | undefined {
   if (value === undefined) return undefined;
 
-  const resolved = interpolateEnvVars(value);
+  const resolved = interpolateEnvVars(value, environment);
   if (resolved === "~") return homedir();
   if (resolved.startsWith("~/") || resolved.startsWith("~\\")) {
     return join(homedir(), resolved.slice(2));
@@ -195,11 +214,11 @@ export function resolveConfigPath(value: string | undefined): string | undefined
   return resolved;
 }
 
-export function resolveBearerToken(definition: Pick<ServerEntry, "bearerToken" | "bearerTokenEnv">): string | undefined {
+export function resolveBearerToken(definition: Pick<ServerEntry, "bearerToken" | "bearerTokenEnv">, environment: NodeJS.ProcessEnv = process.env): string | undefined {
   if (definition.bearerToken !== undefined) {
-    return interpolateSecretExpression(definition.bearerToken);
+    return interpolateSecretExpression(definition.bearerToken, environment);
   }
-  return definition.bearerTokenEnv ? process.env[definition.bearerTokenEnv] : undefined;
+  return definition.bearerTokenEnv ? environment[definition.bearerTokenEnv] : undefined;
 }
 
 /** Remove OSC control strings, including payloads that have no terminator. */

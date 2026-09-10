@@ -1,5 +1,6 @@
 // types.ts - Core type definitions
 import type {
+  CallToolResult,
   ContentBlock as McpContentBlock,
   ListPromptsResult,
   ListResourcesResult,
@@ -7,7 +8,7 @@ import type {
   Transport as McpTransport,
 } from "@modelcontextprotocol/client";
 import type { TextContent, ImageContent } from "@earendil-works/pi-ai";
-import type { UiStreamMode } from "./ui-stream-types.ts";
+import type { UiStreamMode, UiStreamSummary } from "./ui-stream-types.ts";
 import type { UiToolVisibility } from "./ui-tool-visibility.ts";
 
 export type Transport = McpTransport;
@@ -25,13 +26,24 @@ export type McpServerRuntimeStatus =
   | "not-connected"
   | "disabled";
 
+export type McpListenState =
+  | "active"
+  | "dropped"
+  | "re-establishing"
+  | "legacy"
+  | "not-listening"
+  | "disconnected";
+
 export interface McpServerStatusSnapshot {
   readonly name: string;
   readonly status: McpServerRuntimeStatus;
   readonly toolCount: number;
+  readonly directToolCount: number;
   readonly resourceCount?: number;
   readonly failedAgoSeconds?: number;
   readonly disabled: boolean;
+  readonly listenState: McpListenState;
+  readonly catalogStale?: boolean;
 }
 
 export interface McpStatusSnapshot {
@@ -41,6 +53,15 @@ export interface McpStatusSnapshot {
   readonly totalResources: number;
   readonly connectedCount: number;
   readonly disabledCount: number;
+}
+
+/**
+ * Minimal event-bus surface the status publisher needs. Lives here (leaf
+ * module) so `state.ts` can reference it without importing `mcp-status.ts`,
+ * which imports the state type back — an import cycle at type level.
+ */
+export interface McpStatusEventBus {
+  emit(channel: string, data: unknown): void;
 }
 
 // Import sources for config
@@ -65,6 +86,7 @@ export interface McpTool {
   title?: SdkTool["title"];
   description?: SdkTool["description"];
   inputSchema?: SdkTool["inputSchema"]; // JSON Schema
+  outputSchema?: SdkTool["outputSchema"]; // JSON Schema for structuredContent
   _meta?: SdkTool["_meta"];
 }
 
@@ -154,6 +176,34 @@ export interface UiHostContext {
 }
 
 export type UiDisplayMode = "inline" | "fullscreen" | "pip";
+
+/**
+ * Live handle to a started UI tool session. Lives here (leaf module) so
+ * `state.ts` can reference it without importing `ui-server.ts`, which
+ * imports the state type back — an import cycle at type level.
+ */
+export interface UiServerHandle {
+  url: string;
+  port: number;
+  /** URL of the second-origin MCP Apps sandbox proxy. */
+  proxyUrl: string;
+  proxyPort: number;
+  sessionToken: string;
+  serverName: string;
+  toolName: string;
+  viewer?: "browser" | "glimpse" | "suppressed";
+  windowOpen?: boolean;
+  close: (reason?: string) => void;
+  sendToolInput: (args: Record<string, unknown>) => void;
+  sendToolResult: (result: CallToolResult) => void;
+  sendResultPatch: (result: CallToolResult) => void;
+  sendToolCancelled: (reason: string) => void;
+  sendResourceUpdated: (uri: string) => void;
+  sendHostContext: (context: UiHostContext) => void;
+  /** Get accumulated messages from this session */
+  getSessionMessages: () => UiSessionMessages;
+  getStreamSummary: () => UiStreamSummary | undefined;
+}
 
 // Re-export stream types from the shared lightweight module.
 // This allows the example package to import stream schemas without pulling the full types.ts dependency graph.
@@ -344,7 +394,7 @@ export interface OAuthConfig {
   scope?: string;
   /** Extra authorization URL parameters for provider-specific extensions. Flow-owned parameters cannot be overridden. */
   authorizationParams?: Record<string, string>;
-  /** Exact authorization-code redirect URI for pre-registered clients */
+  /** Authorization-code redirect URI. Loopback URIs may use `{port}` for an OS-assigned port; HTTPS redirects use manual completion. */
   redirectUri?: string;
   /** Client display name for dynamic registration */
   clientName?: string;
@@ -352,6 +402,8 @@ export interface OAuthConfig {
   clientUri?: string;
   /** Client logo URL for dynamic registration; shown on consent screens */
   logoUri?: string;
+  /** HTTPS URL for an authorization-server metadata document used instead of MCP discovery */
+  authServerMetadataUrl?: string;
   /** Security-weakening escape hatch for known-misconfigured authorization servers. */
   skipIssuerMetadataValidation?: boolean;
 }
@@ -376,9 +428,13 @@ export interface ServerEntry {
   /** Explicit rmcp-mux Unix-domain socket path. Mutually exclusive with command and url. */
   socket?: string;
   env?: Record<string, string>;
+  /** Inherit the adapter process environment for stdio servers. Defaults to true; false keeps SDK platform defaults plus explicit env overlays. */
+  inheritEnv?: boolean;
   cwd?: string;
   // HTTP fields
   url?: string;
+  /** PEM CA bundle replacing default roots for this HTTPS MCP origin only. */
+  caFile?: string;
   headers?: Record<string, string>;
   /** Add or replace HTTP headers by running a trusted command for each request. */
   requestHeadersCommand?: HttpRequestHeadersCommand;
@@ -460,6 +516,17 @@ export interface McpOutputGuardSettings {
 
 // Settings
 export type ToolPrefix = "server" | "none" | "short" | "mcp";
+
+const ENCODED_SERVER_NAMESPACE_MARKER = "_mcpns_";
+
+export function formatServerNamespace(serverName: string): string {
+  const normalized = serverName.replace(/-/g, "_");
+  if (normalized === "" || (/^[A-Za-z0-9_]+$/.test(normalized) && !normalized.startsWith(ENCODED_SERVER_NAMESPACE_MARKER))) {
+    return normalized;
+  }
+  const codePoints = Array.from(normalized, character => character.codePointAt(0)!.toString(16)).join("_");
+  return `${ENCODED_SERVER_NAMESPACE_MARKER}${codePoints}`;
+}
 export type HostConfigDiscovery = "off" | "prompt" | "on";
 export type McpFooterStatus = "full" | "compact" | "off";
 
@@ -506,6 +573,16 @@ export interface McpSettings {
   idleTimeout?: number; // minutes, default 10, 0 to disable
   requestTimeoutMs?: number; // milliseconds, overrides the SDK request timeout when > 0
   directTools?: boolean;
+  /**
+   * Validate direct-tool inputs against the advertised schema after recovering
+   * one JSON string layer for object and array properties. Defaults to false.
+   */
+  strictDirectToolArguments?: boolean;
+  /**
+   * Include the byte-bounded raw MCP result in direct-tool details. The default
+   * `lean` mode keeps the existing small details object.
+   */
+  directToolResultDetails?: "lean" | "bounded";
   /** Show the advisory when 75 or more direct tools resolve. Defaults to true. */
   warnOnLargeDirectTools?: boolean;
   /** Register the trusted MCP-only JavaScript scripting tool. Defaults to true; set false to hide it. */
@@ -518,9 +595,8 @@ export interface McpSettings {
   approveTools?: boolean | string[];
   disableProxyTool?: boolean;
   /** Freeze direct-tool registration after the initial sync. Automatic metadata updates
-   * (reconnects, lazy-connect, tool-list-changed) won't rebuild the system prompt,
-   * preserving the prompt-cache prefix. The agent rediscovers explicitly via
-   * mcp({ connect: "server" }). Default: false. */
+   * and explicit reconnects won't rebuild the system prompt, preserving the
+   * prompt-cache prefix. Proxy/search/cache metadata still refreshes. Default: false. */
   freezeDirectTools?: boolean;
   autoAuth?: boolean;
   sampling?: boolean;
@@ -557,11 +633,21 @@ export interface McpSettings {
   oauthDir?: string;
 }
 
+export interface ClaudePluginConfig {
+  /** Explicit local Claude plugin directory. File-based config resolves relative paths from the active project cwd; createMcpAdapter snapshots programmatic paths against process.cwd(). */
+  path: string;
+  /** Load the plugin's root .mcp.json as low-precedence MCP defaults. */
+  mcp?: boolean;
+  /** Expose the plugin's root skills/ directory to Pi resource discovery. */
+  skills?: boolean;
+}
+
 // Root config
 export interface McpConfig {
   mcpServers: Record<string, ServerEntry>;
   imports?: ImportKind[];
   settings?: McpSettings;
+  claudePlugins?: ClaudePluginConfig[];
 }
 
 export interface McpAdapterOptions {
@@ -580,6 +666,7 @@ export interface ToolMetadata {
   uiResourceUri?: string; // For app-enabled tools: the UI resource URI
   uiVisibility?: UiToolVisibility[];
   inputSchema?: unknown;  // JSON Schema for parameters (stored for describe/errors)
+  outputSchema?: unknown; // Server schema for structuredContent (stored for describe)
   uiStreamMode?: UiStreamMode;
 }
 
@@ -618,6 +705,7 @@ export interface CachedTool {
   name: string;
   description?: string;
   inputSchema?: unknown;
+  outputSchema?: unknown;
   uiResourceUri?: string;
   uiVisibility?: UiToolVisibility[];
   uiStreamMode?: "eager" | "stream-first";
@@ -642,6 +730,9 @@ export interface ServerCacheEntry {
   resources: CachedResource[];
   prompts?: CachedPrompt[];
   instructions?: string;
+  /** Server-level hints from the aggregated tools/list result. */
+  ttlMs?: ListToolsResult["ttlMs"];
+  cacheScope?: ListToolsResult["cacheScope"];
   cachedAt: number;
 }
 
@@ -661,6 +752,8 @@ export interface McpPanelCallbacks {
 
 export interface McpPanelResult {
   changes: Map<string, true | string[] | false>;
+  /** Servers whose disabled flag changed during the panel session (name → new disabled state). */
+  disabledChanges: Map<string, boolean>;
   cancelled: boolean;
 }
 
