@@ -485,6 +485,12 @@ describe("runMcpScript", () => {
     ]);
   });
 
+  it.each([100, 16384, 32768, 60000])("preserves script-readable results at %i bytes", async (bytes) => {
+    const result = await runMcpScript(state, `const r = await tools.fixture_echo({value: "x".repeat(${bytes})}); return {text: r.data.content[0].text.length, structured: r.data.structuredContent.echoed.length};`);
+    expect(result.details).not.toHaveProperty("error");
+    expect(JSON.parse(textBlocks(result).at(-1)!)).toEqual({text: bytes, structured: bytes});
+  });
+
   it("returns a failure envelope and lets the script continue", async () => {
     const result = await runMcpScript(
       state,
