@@ -1147,7 +1147,7 @@ export async function executeCall(
   signal?: AbortSignal,
   origin?: "proxy" | "script",
   // Internal consumers own successful data delivery; origin remains approval metadata only.
-  internalDelivery?: { onSuccess: (data: unknown) => void },
+  internalDelivery?: { onSuccess: (data: unknown) => void; onError?: (result: ClientCallToolResult) => void },
 ): Promise<ProxyToolResult> {
   const ownedSignal = combineAbortSignals(state.owner?.signal, signal);
   throwIfAborted(ownedSignal);
@@ -1629,6 +1629,7 @@ export async function executeCall(
       },
     );
 
+    if (result.isError) internalDelivery?.onError?.(result);
     if (toolMeta.uiResourceUri) {
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/client").CallToolResult);
     }

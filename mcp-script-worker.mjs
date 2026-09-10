@@ -65,31 +65,36 @@ function request(type, payload) {
   });
 }
 
+class McpCallError extends Error {
+  constructor(failure) {
+    super(failure.message);
+    this.name = "McpCallError";
+    this.code = failure.code;
+    this.details = failure.details;
+    this.failure = failure;
+  }
+}
+
+async function callTool(path, args, capture = false) {
+  const result = typeof path !== "string" || path.trim() === ""
+    ? { ok: false, error: { code: "invalid_tool_path", message: "tools.call(path, args) requires a non-empty tool path." } }
+    : await request("call", { path, args });
+  if (!capture && !result.ok) throw new McpCallError(result.error);
+  return result;
+}
+
 const tools = new Proxy(Object.create(null), {
   get(_target, property) {
     if (property === "search") {
       return async (input) => request("search", { input });
     }
-    if (property === "call") {
-      return async (path, args) => {
-        // Invalid paths never reach dispatch and therefore never appear in the call trace.
-        if (typeof path !== "string" || path.trim() === "") {
-          return {
-            ok: false,
-            error: {
-              code: "invalid_tool_path",
-              message: "tools.call(path, args) requires a non-empty tool path.",
-            },
-          };
-        }
-        return request("call", { path, args });
-      };
-    }
+    if (property === "call") return (path, args) => callTool(path, args);
+    if (property === "capture") return (path, args) => callTool(path, args, true);
     if (property === "describe") {
       return async (input) => request("describe", { input });
     }
     if (typeof property !== "string" || RESERVED_TOOL_PROPS.has(property)) return undefined;
-    return (args) => request("call", { path: property, args });
+    return (args) => callTool(property, args);
   },
   ownKeys() {
     throw new Error(TOOLS_ENUMERATION_ERROR);
@@ -132,6 +137,7 @@ void (async () => {
     parentPort.postMessage({
       type: "error",
       message: error instanceof Error ? error.message : String(error),
+      ...(error instanceof McpCallError ? { failure: error.failure } : {}),
     });
   }
 })();
