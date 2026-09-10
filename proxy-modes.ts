@@ -645,11 +645,16 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
   const metadata = state.toolMetadata.get(server);
   const toolNames = metadata?.map(m => m.name) ?? [];
   const connection = state.manager.getConnection(server);
-  const instructions = state.serverInstructions.get(server);
+  const connected = connection?.status === "connected";
+  const instructions = connected ? connection.instructions : state.serverInstructions.get(server);
+  const instructionsSource = instructions ? (connected ? "live" : "cached") : undefined;
   let instructionsText = "";
   if (instructions) {
     const preview = truncateAtWord(instructions, INSTRUCTIONS_PREVIEW_LENGTH);
-    instructionsText = `\n\nServer instructions:\n${preview}`;
+    const heading = connected
+      ? "Server instructions (live connection):"
+      : "Cached server instructions (not connected; runtime paths are historical, not current ownership evidence):";
+    instructionsText = `\n\n${heading}\n${preview}`;
     if (preview !== instructions) {
       instructionsText += `\nUse mcp({ instructions: "${server}" }) for the full text.`;
     }
@@ -659,18 +664,18 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
     if (connection?.status === "connected") {
       return {
         content: [{ type: "text" as const, text: `Server "${server}" has no tools.${instructionsText}` }],
-        details: { mode: "list", server, tools: [], count: 0, hasInstructions: Boolean(instructions) },
+        details: { mode: "list", server, tools: [], count: 0, hasInstructions: Boolean(instructions), instructionsSource },
       };
     }
     if (metadata !== undefined) {
       return {
         content: [{ type: "text" as const, text: `Server "${server}" has no cached tools (not connected).${instructionsText}` }],
-        details: { mode: "list", server, tools: [], count: 0, cached: true, hasInstructions: Boolean(instructions) },
+        details: { mode: "list", server, tools: [], count: 0, cached: true, hasInstructions: Boolean(instructions), instructionsSource },
       };
     }
     return {
       content: [{ type: "text" as const, text: `Server "${server}" is configured but not connected. Use mcp({ connect: "${server}" }) or /mcp reconnect ${server} to retry.${instructionsText}` }],
-      details: { mode: "list", server, tools: [], count: 0, error: "not_connected", hasInstructions: Boolean(instructions) },
+      details: { mode: "list", server, tools: [], count: 0, error: "not_connected", hasInstructions: Boolean(instructions), instructionsSource },
     };
   }
 
@@ -696,7 +701,7 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
 
   return {
     content: [{ type: "text" as const, text: text.trim() }],
-    details: { mode: "list", server, tools: toolNames, count: toolNames.length, hasInstructions: Boolean(instructions) },
+    details: { mode: "list", server, tools: toolNames, count: toolNames.length, hasInstructions: Boolean(instructions), instructionsSource },
   };
 }
 
@@ -710,16 +715,20 @@ export function executeInstructions(state: McpExtensionState, server: string): P
   }
   if (isServerDisabled(definition)) return disabledResult("instructions", server);
 
-  const instructions = state.serverInstructions.get(server);
+  const connection = state.manager.getConnection(server);
+  const connected = connection?.status === "connected";
+  const instructions = connected ? connection.instructions : state.serverInstructions.get(server);
   if (instructions) {
+    const heading = connected
+      ? `${server} instructions (live connection):`
+      : `${server}: Cached server instructions (not connected; runtime paths are historical, not current ownership evidence):`;
     return {
-      content: [{ type: "text" as const, text: `${server} instructions:\n\n${instructions}` }],
-      details: { mode: "instructions", server, length: instructions.length },
+      content: [{ type: "text" as const, text: `${heading}\n\n${instructions}` }],
+      details: { mode: "instructions", server, length: instructions.length, instructionsSource: connected ? "live" : "cached" },
     };
   }
 
-  const connection = state.manager.getConnection(server);
-  if (connection?.status === "connected") {
+  if (connected) {
     return {
       content: [{ type: "text" as const, text: `Server "${server}" does not provide instructions.` }],
       details: { mode: "instructions", server, error: "no_instructions" },
