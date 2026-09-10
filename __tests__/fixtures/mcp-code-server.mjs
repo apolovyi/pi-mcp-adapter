@@ -14,7 +14,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "Echo a value",
       inputSchema: {
         type: "object",
-        properties: { value: {} },
+        properties: { value: { type: "string", minLength: 1 } },
+        required: ["value"],
+        additionalProperties: false,
       },
     },
     {

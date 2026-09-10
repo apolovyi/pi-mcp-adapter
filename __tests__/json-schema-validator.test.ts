@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JsonSchemaType } from "@modelcontextprotocol/client";
-import { createJsonSchemaValidator } from "../json-schema-validator.ts";
+import { createJsonSchemaValidator, prepareToolArguments } from "../json-schema-validator.ts";
 
 const draft07 = "http://json-schema.org/draft-07/schema#";
 const draft07Https = "https://json-schema.org/draft-07/schema#";
@@ -8,6 +8,19 @@ const draft07Https = "https://json-schema.org/draft-07/schema#";
 function validate(schema: Record<string, unknown>, value: unknown) {
   return createJsonSchemaValidator().getValidator(schema as JsonSchemaType)(value);
 }
+
+describe("prepareToolArguments", () => {
+  it.each([null, 42, [], "schema"])("rejects malformed schema %j", (schema) => {
+    expect(prepareToolArguments({}, schema)).toMatchObject({ ok: false, error: "invalid_tool_schema" });
+  });
+
+  it("preserves source strings exactly without evaluating or repairing them", () => {
+    for (const source of [String.raw`(value) => "quoted \\"value\\""`, '() => document.querySelector("[aria-label="Primary content"]")', ((value: string) => value).toString()]) {
+      expect(prepareToolArguments({ function: source }, { type: "object", properties: { function: { type: "string" } } }))
+        .toEqual({ ok: true, args: { function: source } });
+    }
+  });
+});
 
 describe("createJsonSchemaValidator", () => {
   it.each([draft07, draft07Https])("routes %s to draft-07 semantics", schema => {

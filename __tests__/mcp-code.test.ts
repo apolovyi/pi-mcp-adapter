@@ -491,6 +491,28 @@ describe("runMcpScript", () => {
     expect(JSON.parse(textBlocks(result).at(-1)!)).toEqual({text: bytes, structured: bytes});
   });
 
+  it("replays twelve synthetic responses across the historical size boundary", async () => {
+    const sizes = [100, 15904, 6907, 11229, 13843, 16695];
+    const result = await runMcpScript(state, `
+      function parsed(r) {
+        const t = r.data.content.find(x => x.type === 'text').text;
+        const m = t.match(/### Result\\n([\\s\\S]*?)\\n### Ran/);
+        return JSON.parse(m[1]);
+      }
+      const results = [];
+      for (const size of ${JSON.stringify(sizes)}) {
+        await tools.fixture_echo({value:"synthetic navigation"});
+        const value = "### Result\\n" + JSON.stringify({payload:"x".repeat(size)}) + "\\n### Ran";
+        results.push(parsed(await tools.fixture_echo({value})).payload.length);
+      }
+      return results;
+    `);
+    expect(result.details).not.toHaveProperty("error");
+    expect(JSON.parse(textBlocks(result)[0])).toEqual(sizes);
+    expect(result.details.calls).toHaveLength(12);
+    expect(result.details.calls.every((call: { ok: boolean }) => call.ok)).toBe(true);
+  });
+
   it("requires explicit capture to continue after a failed call", async () => {
     const result = await runMcpScript(
       state,
@@ -626,6 +648,11 @@ describe("runMcpScript", () => {
     const block = textBlocks(result).at(-1)!;
     expect(block).not.toContain("Circular");
     expect(JSON.parse(block)).toEqual({ first: { id: "same" }, second: { id: "same" } });
+  });
+
+  it("supports URL construction without exposing network or process access", async () => {
+    const result = await runMcpScript(state, 'const url = new URL("https://example.com/synthetic"); url.search = new URLSearchParams({q:"quoted \\\"value\\\""}); return {query:url.searchParams.get("q"),network:typeof fetch,process:typeof process,timers:typeof setTimeout};');
+    expect(JSON.parse(textBlocks(result)[0])).toEqual({query:'quoted "value"',network:"undefined",process:"undefined",timers:"undefined"});
   });
 
   it("rejects tools enumeration with discovery guidance without exposing host globals", async () => {

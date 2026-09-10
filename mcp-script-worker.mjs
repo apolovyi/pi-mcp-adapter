@@ -124,6 +124,8 @@ void (async () => {
       jev,
       emit,
       console: capturedConsole,
+      URL,
+      URLSearchParams,
     }), {
       codeGeneration: { strings: false, wasm: false },
       name: "mcpScript",

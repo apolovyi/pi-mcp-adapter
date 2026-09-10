@@ -1,5 +1,5 @@
 import type { AgentToolResult, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { UrlElicitationRequiredError, type Client, type JsonSchemaType, type JsonSchemaValidator, type Progress, type RequestOptions } from "@modelcontextprotocol/client";
+import { UrlElicitationRequiredError, type Client, type Progress, type RequestOptions } from "@modelcontextprotocol/client";
 import { createRequire } from "node:module";
 import type { McpExtensionState } from "./state.ts";
 import type { ToolMetadata, McpContent } from "./types.ts";
@@ -13,7 +13,8 @@ import { reconstructPromptMetadata } from "./metadata-cache.ts";
 import { resolveMcpResultContent, transformMcpResourceContents } from "./tool-registrar.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
 import { maybeStartUiSession, summarizeUiSessionResult, type UiSessionRuntime } from "./ui-session.ts";
-import { formatAuthRequiredMessage, formatMcpStatus, normalizeToolArguments, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { formatAuthRequiredMessage, formatMcpStatus, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { prepareToolArguments } from "./json-schema-validator.ts";
 import { authenticate, completeAuthFromInput, getAuthStatus, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
 import { callToolViaTaskSession } from "./mcp-tasks.ts";
@@ -22,31 +23,14 @@ import { ensureToolCallApproved, isToolCallApprovalRequired } from "./tool-appro
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
 import { semanticSearch, type SemanticSearchBackend, type SemanticSearchEvaluator } from "./semantic-search.ts";
 import { getInputRequiredNeedsUiDetails } from "./errors.ts";
-import { createJsonSchemaValidator } from "./json-schema-validator.ts";
 
 type ProxyToolResult = AgentToolResult<Record<string, unknown>>;
 type ClientCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
 type ClientReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
 
 const require = createRequire(import.meta.url);
-const proxyArgumentValidators = new WeakMap<object, JsonSchemaValidator<unknown>>();
 const MAX_REGEX_SEARCH_QUERY_LENGTH = 256;
 
-function proxyArgumentValidationError(inputSchema: unknown, args: unknown): string | null {
-  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return null;
-  try {
-    let validate = proxyArgumentValidators.get(inputSchema);
-    if (!validate) {
-      validate = createJsonSchemaValidator().getValidator(inputSchema as JsonSchemaType);
-      proxyArgumentValidators.set(inputSchema, validate);
-    }
-    const result = validate(args);
-    return result.valid ? null : result.errorMessage ?? "arguments do not match the advertised input schema";
-  } catch {
-    // Preserve server-side validation for schema dialects the adapter cannot evaluate.
-    return null;
-  }
-}
 const INSTRUCTIONS_PREVIEW_LENGTH = 300;
 const REGEX_SAFETY_CHECK_PARAMS = {
   attackTimeout: 50,
@@ -1482,19 +1466,14 @@ export async function executeCall(
     return disabledCallResult(serverName, toolMeta);
   }
 
-  const normalizedArgs = toolMeta.resourceUri ? args ?? {} : normalizeToolArguments(args);
-  const validationError = toolMeta.resourceUri ? null : proxyArgumentValidationError(toolMeta.inputSchema, normalizedArgs);
-  if (validationError) {
-    const schemaText = `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
-    const guarded = await guardMcpOutput(
-      [{ type: "text" as const, text: validationError }],
-      { ...resolveMcpOutputGuardOptions(state.config.settings), prefix: "Failed to call tool: ", suffix: schemaText },
-    );
+  const prepared = toolMeta.resourceUri ? { ok: true as const, args: args ?? {} } : prepareToolArguments(args, toolMeta.inputSchema);
+  if (!prepared.ok) {
     return {
-      content: guarded.content,
-      details: { mode: "call", error: "call_failed", ...callIdentity, message: validationError, ...guardedMcpDetails(guarded) },
+      content: [{ type: "text", text: prepared.message }],
+      details: { mode: "call", error: prepared.error, message: prepared.message, phase: "validation", execution: "not_started", ...callIdentity },
     };
   }
+  const normalizedArgs = prepared.args;
   const approval = await ensureToolCallApproved(
     state,
     serverName,

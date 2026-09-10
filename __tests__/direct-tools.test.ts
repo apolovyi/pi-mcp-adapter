@@ -1144,9 +1144,9 @@ describe("excludeTools filtering", () => {
     const { executeCall } = await import("../proxy-modes.ts");
     await expect(executeCall(state, "my-server_search-records", {})).resolves.toMatchObject({ details: { server: "my-server", tool: "search-records" } });
     expect(callTool).toHaveBeenCalledOnce();
-    await expect(executeCall(state, "my-server_search-records", { token: undefined })).rejects.toThrow(
-      "tool arguments: value at token is not JSON-serializable",
-    );
+    await expect(executeCall(state, "my-server_search-records", { token: undefined })).resolves.toMatchObject({
+      details: { error: "invalid_arguments", phase: "validation", execution: "not_started", message: expect.stringContaining("tool arguments: value at token is not JSON-serializable") },
+    });
     expect(callTool).toHaveBeenCalledOnce();
   });
 
