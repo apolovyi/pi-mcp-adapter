@@ -52,6 +52,7 @@ describe("direct tools auto auth", () => {
       });
 
     const state = {
+      toolMetadata: new Map(),
       config: {
         settings: { autoAuth: true },
         mcpServers: {
@@ -124,6 +125,7 @@ describe("direct tools auto auth", () => {
       },
     };
     const state = {
+      toolMetadata: new Map(),
       config: { settings: {}, mcpServers: { demo: { command: "demo" } } },
       manager: {
         getConnection: vi.fn(() => connection),
@@ -163,6 +165,7 @@ describe("direct tools auto auth", () => {
     reason.name = "AbortError";
     mocks.authenticate.mockRejectedValueOnce(reason);
     const state = {
+      toolMetadata: new Map(),
       config: {
         settings: { autoAuth: true },
         mcpServers: { demo: { url: "https://api.example.com/mcp", auth: "oauth" } },
@@ -199,6 +202,7 @@ describe("direct tools auto auth", () => {
     const { createDirectToolExecutor } = await import("../direct-tools.ts");
 
     const state = {
+      toolMetadata: new Map(),
       config: {
         settings: { autoAuth: true },
         mcpServers: {
@@ -251,6 +255,7 @@ describe("direct tools auto auth", () => {
       client: { callTool: vi.fn().mockRejectedValue(error) },
     };
     const state = {
+      toolMetadata: new Map(),
       config: { settings: {}, mcpServers: { demo: { command: "demo" } } },
       manager: {
         getConnection: vi.fn(() => connection),
@@ -281,6 +286,7 @@ describe("direct tools auto auth", () => {
     const { createDirectToolExecutor } = await import("../direct-tools.ts");
 
     const state = {
+      toolMetadata: new Map(),
       config: {
         settings: {
           autoAuth: true,

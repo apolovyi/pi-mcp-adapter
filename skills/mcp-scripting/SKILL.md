@@ -36,4 +36,18 @@ return result.data;
 
 `tools.search` and `tools.describe` are asynchronous and must be awaited. The default script timeout is 30 seconds; the worker is terminated at the deadline, including for infinite loops. Every invocation still uses normal lazy connection, authentication, output guarding, and approval gates. Result details contain a concise `calls` trace with every search, describe, and call operation; each entry includes its query or path, outcome, and duration.
 
+Arguments are validated against the current advertised input schema before approval and tool dispatch. Validation failures report `phase: "validation"` and `execution: "not_started"`; invalid metadata is not silently downgraded. Re-describe or explicitly reconnect when metadata is stale; never guess replacement fields.
+
+The sandbox provides `URL` and `URLSearchParams` for pure URL construction, plus standard JavaScript values and Promise utilities. It does not provide `fetch`, `require`, `process`, or timers. Use an MCP wait tool when waiting on remote state.
+
+For a tool accepting JavaScript source, serialize a self-contained function once rather than nesting escaped source strings. The remote function cannot capture local script variables:
+
+```js
+const source = (() => document.querySelector('[aria-label="Primary content"]')?.textContent).toString();
+const result = await tools.call("playwright_browser_evaluate", { function: source });
+return result.data;
+```
+
+Source strings are forwarded unchanged; schema validation is not JavaScript syntax validation or automatic source repair. Keep external values in structured arguments when the remote tool supports them.
+
 Use plain JavaScript loops and Promise utilities for composition. Fluent helpers such as `tools.find(...).one()`, `tools.parallel(...)`, and `tools.retry(...)` are not provided.

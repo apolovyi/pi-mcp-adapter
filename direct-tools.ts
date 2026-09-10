@@ -15,7 +15,8 @@ import { createToolSelectorCandidateIndex, formatToolName, getToolNameCandidates
 import { isUiToolVisibleToModel } from "./ui-tool-visibility.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import { authenticate, supportsOAuth } from "./mcp-auth-flow.ts";
-import { formatAuthRequiredMessage, normalizeToolArguments, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { formatAuthRequiredMessage, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { prepareToolArguments } from "./json-schema-validator.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
 import { combineAbortSignals, isAbortError } from "./runtime-owner.ts";
 import { ensureToolCallApproved } from "./tool-approval.ts";
@@ -429,7 +430,16 @@ export function createDirectToolExecutor(
       };
     }
 
-    const normalizedParams = spec.resourceUri ? params : normalizeToolArguments(params);
+    const currentMetadata = state.toolMetadata.get(spec.serverName)?.find((tool) => tool.originalName === spec.originalName);
+    const schema = currentMetadata ? currentMetadata.inputSchema : spec.inputSchema;
+    const prepared = spec.resourceUri ? { ok: true as const, args: params } : prepareToolArguments(params, schema);
+    if (!prepared.ok) {
+      return {
+        content: [{ type: "text", text: prepared.message }],
+        details: { mode: "call", error: prepared.error, message: prepared.message, phase: "validation", execution: "not_started", server: spec.serverName, tool: spec.originalName },
+      };
+    }
+    const normalizedParams = prepared.args;
     const approval = await ensureToolCallApproved(state, spec.serverName, {
       name: spec.prefixedName,
       originalName: spec.originalName,

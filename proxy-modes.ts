@@ -13,7 +13,8 @@ import { reconstructPromptMetadata } from "./metadata-cache.ts";
 import { resolveMcpResultContent, transformMcpContent, transformMcpResourceContents } from "./tool-registrar.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
 import { maybeStartUiSession, summarizeUiSessionResult, type UiSessionRuntime } from "./ui-session.ts";
-import { formatAuthRequiredMessage, formatMcpStatus, normalizeToolArguments, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { formatAuthRequiredMessage, formatMcpStatus, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { prepareToolArguments } from "./json-schema-validator.ts";
 import { authenticate, completeAuthFromInput, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
 import { paginate, rankSuggestions, rankToolMatches, resolveSearchKeywords } from "./search-ranking.ts";
@@ -1137,7 +1138,14 @@ export async function executeCall(
     return disabledCallResult(serverName, toolMeta);
   }
 
-  const normalizedArgs = toolMeta.resourceUri ? args ?? {} : normalizeToolArguments(args);
+  const prepared = toolMeta.resourceUri ? { ok: true as const, args: args ?? {} } : prepareToolArguments(args, toolMeta.inputSchema);
+  if (!prepared.ok) {
+    return {
+      content: [{ type: "text", text: prepared.message }],
+      details: { mode: "call", error: prepared.error, message: prepared.message, phase: "validation", execution: "not_started", ...callIdentity },
+    };
+  }
+  const normalizedArgs = prepared.args;
   const approval = await ensureToolCallApproved(
     state,
     serverName,
