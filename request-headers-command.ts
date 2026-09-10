@@ -1,4 +1,4 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { FetchLike } from "@modelcontextprotocol/client";
 import type { HttpRequestHeadersCommand } from "./types.ts";
@@ -8,9 +8,6 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const USE_PROCESS_GROUP = process.platform !== "win32";
 const CLEANUP_TOKEN_ENV = "PI_MCP_REQUEST_HEADERS_CLEANUP_TOKEN";
-// Busy hosts can exceed spawnSync's 1 MiB default when `ps axeww` dumps each
-// process environment. Keep discovery below a bounded cap instead of letting
-// `ps` get SIGTERM'd and reporting a false cleanup failure.
 const PS_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 
 function isNoSuchProcessError(error: unknown): boolean {
@@ -35,10 +32,14 @@ function collectPosixProcessPids(rootPid: number, cleanupToken?: string): number
     throw new Error(`HTTP request headers command cleanup failed: ${psFailureReason(result)}`);
   }
 
+  return parsePosixProcessPids(result.stdout, rootPid, cleanupToken);
+}
+
+function parsePosixProcessPids(stdout: string, rootPid: number, cleanupToken?: string): number[] {
   const childrenByParent = new Map<number, number[]>();
   const processPids = new Set<number>();
   const needle = cleanupToken ? `${CLEANUP_TOKEN_ENV}=${cleanupToken}` : undefined;
-  for (const line of result.stdout.split("\n")) {
+  for (const line of stdout.split("\n")) {
     const match = /^\s*(\d+)\s+(\d+)(?:\s+(.*))?$/.exec(line);
     if (!match) continue;
     const pid = Number(match[1]);
@@ -204,27 +205,46 @@ async function invokeRequestHeadersCommand(
 
     const trackedPosixDescendantPids = new Set<number>();
     let trackingError: Error | undefined;
+    let descendantScan: ChildProcess | undefined;
+    let trackingStopped = false;
     const trackPosixDescendants = () => {
-      if (!USE_PROCESS_GROUP || child.pid === undefined || settled || trackingError) return;
-      try {
-        for (const pid of collectPosixProcessPids(child.pid, cleanupToken)) trackedPosixDescendantPids.add(pid);
-      } catch (error) {
-        trackingError = error instanceof Error ? error : new Error(String(error));
-      }
+      const rootPid = child.pid;
+      if (!USE_PROCESS_GROUP || rootPid === undefined || trackingStopped || trackingError || descendantScan) return;
+      descendantScan = execFile("ps", ["axeww", "-o", "pid=,ppid=,command="], {
+        encoding: "utf8",
+        maxBuffer: PS_MAX_BUFFER_BYTES,
+      }, (error, stdout) => {
+        descendantScan = undefined;
+        if (trackingStopped) return;
+        if (error) {
+          const reason = error.signal ? `ps was killed by signal ${error.signal}` : `ps exited with code ${error.code ?? "unknown"}`;
+          trackingError = new Error(`HTTP request headers command cleanup failed: ${reason}`);
+          return;
+        }
+        for (const pid of parsePosixProcessPids(stdout, rootPid, cleanupToken)) trackedPosixDescendantPids.add(pid);
+      });
     };
     const descendantTracker = USE_PROCESS_GROUP ? setInterval(trackPosixDescendants, 50) : undefined;
     descendantTracker?.unref();
+    const stopDescendantTracking = () => {
+      trackingStopped = true;
+      if (descendantTracker) clearInterval(descendantTracker);
+      descendantScan?.kill();
+      descendantScan = undefined;
+    };
+    child.once("exit", stopDescendantTracking);
 
     const finish = (result: CommandResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (descendantTracker) clearInterval(descendantTracker);
+      stopDescendantTracking();
       signal.removeEventListener("abort", abort);
       if (result.status === "error") reject(result.error);
       else resolve(result.headers);
     };
     const finishAfterKill = (result: CommandResult) => {
+      stopDescendantTracking();
       try {
         killRequestHeadersCommand(child, trackedPosixDescendantPids, cleanupToken);
         finish(result);
