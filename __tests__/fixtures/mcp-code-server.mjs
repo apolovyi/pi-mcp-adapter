@@ -14,7 +14,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "Echo a value",
       inputSchema: {
         type: "object",
-        properties: { value: {} },
+        properties: { value: { type: "string", minLength: 1 } },
+        required: ["value"],
+        additionalProperties: false,
       },
     },
     {
@@ -45,7 +47,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return result;
   }
   if (request.params.name === "fail") {
-    return { isError: true, content: [{ type: "text", text: "fixture failure" }] };
+    return { isError: true, content: [{ type: "text", text: "fixture failure" }], structuredContent: { code: "synthetic_failure", execution: "unknown" }, _meta: { source: "synthetic" } };
   }
   if (request.params.name === "hang") {
     return new Promise(() => {});

@@ -10,8 +10,6 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { MCP_TOOL_APPROVAL_REQUEST_EVENT, type McpToolApprovalRequest } from "../types.ts";
 
-// Real host event bus, registered tools, session, and stdio MCP transport.
-// The receipt log distinguishes broker denial from a call dispatched to the server.
 describe("approval broker through Pi registered script calls", () => {
   it.each(["deny", "abstain", "no claim"] as const)(
     "consults the broker before a cached grant: %s",
@@ -70,9 +68,9 @@ describe("approval broker through Pi registered script calls", () => {
         const result = await script!.execute("approval-script", {
           code: `
             const first = await tools.call("fixture_echo", { value: "same" });
-            const second = await tools.call("fixture_echo", { value: "same" });
+            const second = await tools.capture("fixture_echo", { value: "same" });
             const third = await tools.call("fixture_echo", { value: "same" });
-            const uncached = await tools.call("fixture_echo", { value: "new" });
+            const uncached = await tools.capture("fixture_echo", { value: "new" });
             return [first, second, third, uncached];
           `,
         }, undefined, undefined, session.extensionRunner.createContext());
@@ -82,7 +80,6 @@ describe("approval broker through Pi registered script calls", () => {
         expect(results[0]).toMatchObject({ ok: true });
         expect(results[1]).toMatchObject(secondDecision === "deny"
           ? { ok: false, error: { code: "approval_denied" } } : { ok: true });
-        // A denial is not revocation: the next abstention still uses the grant.
         expect(results[2]).toMatchObject({ ok: true });
         expect(results[3]).toMatchObject({ ok: false, error: { code: "approval_required" } });
         expect(requests).toHaveLength(4);

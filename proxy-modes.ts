@@ -13,7 +13,8 @@ import { reconstructPromptMetadata } from "./metadata-cache.ts";
 import { resolveMcpResultContent, transformMcpContent, transformMcpResourceContents } from "./tool-registrar.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
 import { maybeStartUiSession, summarizeUiSessionResult, type UiSessionRuntime } from "./ui-session.ts";
-import { formatAuthRequiredMessage, formatMcpStatus, normalizeToolArguments, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { formatAuthRequiredMessage, formatMcpStatus, resolveServerUrl, truncateAtWord } from "./utils.ts";
+import { prepareToolArguments } from "./json-schema-validator.ts";
 import { authenticate, completeAuthFromInput, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
 import { paginate, rankSuggestions, rankToolMatches, resolveSearchKeywords } from "./search-ranking.ts";
@@ -748,11 +749,16 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
       details: { mode: "list", server, tools: [], count: 0, error: "server_backoff" },
     };
   }
-  const instructions = state.serverInstructions.get(server);
+  const connected = connection?.status === "connected";
+  const instructions = connected ? connection.instructions : state.serverInstructions.get(server);
+  const instructionsSource = instructions ? (connected ? "live" : "cached") : undefined;
   let instructionsText = "";
   if (instructions) {
     const preview = truncateAtWord(instructions, INSTRUCTIONS_PREVIEW_LENGTH);
-    instructionsText = `\n\nServer instructions:\n${preview}`;
+    const heading = connected
+      ? "Server instructions (live connection):"
+      : "Cached server instructions (not connected; runtime paths are historical, not current ownership evidence):";
+    instructionsText = `\n\n${heading}\n${preview}`;
     if (preview !== instructions) {
       instructionsText += `\nUse mcp({ instructions: "${server}" }) for the full text.`;
     }
@@ -762,18 +768,18 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
     if (connection?.status === "connected") {
       return {
         content: [{ type: "text" as const, text: `Server "${server}" has no tools.${instructionsText}` }],
-        details: { mode: "list", server, tools: [], count: 0, hasInstructions: Boolean(instructions) },
+        details: { mode: "list", server, tools: [], count: 0, hasInstructions: Boolean(instructions), instructionsSource },
       };
     }
     if (metadata !== undefined) {
       return {
         content: [{ type: "text" as const, text: `Server "${server}" has no cached tools (not connected).${instructionsText}` }],
-        details: { mode: "list", server, tools: [], count: 0, cached: true, hasInstructions: Boolean(instructions) },
+        details: { mode: "list", server, tools: [], count: 0, cached: true, hasInstructions: Boolean(instructions), instructionsSource },
       };
     }
     return {
       content: [{ type: "text" as const, text: `Server "${server}" is configured but not connected. Use mcp({ connect: "${server}" }) or /mcp reconnect ${server} to retry.${instructionsText}` }],
-      details: { mode: "list", server, tools: [], count: 0, error: "not_connected", hasInstructions: Boolean(instructions) },
+      details: { mode: "list", server, tools: [], count: 0, error: "not_connected", hasInstructions: Boolean(instructions), instructionsSource },
     };
   }
 
@@ -809,7 +815,7 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
 
   return {
     content: [{ type: "text" as const, text: text.trim() }],
-    details: { mode: "list", server, tools: toolNames, count: toolNames.length, hasInstructions: Boolean(instructions) },
+    details: { mode: "list", server, tools: toolNames, count: toolNames.length, hasInstructions: Boolean(instructions), instructionsSource },
   };
 }
 
@@ -824,16 +830,20 @@ export function executeInstructions(state: McpExtensionState, server: string): P
   if (isServerDisabled(definition)) return disabledResult("instructions", server);
   if (isServerInActiveFailureBackoff(state, server)) return serverBackoffResult(state, "instructions", server);
 
-  const instructions = state.serverInstructions.get(server);
+  const connection = state.manager.getConnection(server);
+  const connected = connection?.status === "connected";
+  const instructions = connected ? connection.instructions : state.serverInstructions.get(server);
   if (instructions) {
+    const heading = connected
+      ? `${server} instructions (live connection):`
+      : `${server}: Cached server instructions (not connected; runtime paths are historical, not current ownership evidence):`;
     return {
-      content: [{ type: "text" as const, text: `${server} instructions:\n\n${instructions}` }],
-      details: { mode: "instructions", server, length: instructions.length },
+      content: [{ type: "text" as const, text: `${heading}\n\n${instructions}` }],
+      details: { mode: "instructions", server, length: instructions.length, instructionsSource: connected ? "live" : "cached" },
     };
   }
 
-  const connection = state.manager.getConnection(server);
-  if (connection?.status === "connected") {
+  if (connected) {
     return {
       content: [{ type: "text" as const, text: `Server "${server}" does not provide instructions.` }],
       details: { mode: "instructions", server, error: "no_instructions" },
@@ -926,8 +936,7 @@ export async function executeCall(
   getPiTools?: () => ToolInfo[],
   signal?: AbortSignal,
   origin?: "proxy" | "script",
-  // Internal consumers own successful data delivery; origin remains approval metadata only.
-  internalDelivery?: { onSuccess: (data: unknown) => void },
+  internalDelivery?: { onSuccess: (data: unknown) => void; onError?: (result: ClientCallToolResult) => void },
 ): Promise<ProxyToolResult> {
   const ownedSignal = combineAbortSignals(state.owner?.signal, signal);
   throwIfAborted(ownedSignal);
@@ -1265,7 +1274,14 @@ export async function executeCall(
     return disabledCallResult(serverName, toolMeta);
   }
 
-  const normalizedArgs = toolMeta.resourceUri ? args ?? {} : normalizeToolArguments(args);
+  const prepared = toolMeta.resourceUri ? { ok: true as const, args: args ?? {} } : prepareToolArguments(args, toolMeta.inputSchema);
+  if (!prepared.ok) {
+    return {
+      content: [{ type: "text", text: prepared.message }],
+      details: { mode: "call", error: prepared.error, message: prepared.message, phase: "validation", execution: "not_started", ...callIdentity },
+    };
+  }
+  const normalizedArgs = prepared.args;
   const approval = await ensureToolCallApproved(
     state,
     serverName,
@@ -1391,6 +1407,7 @@ export async function executeCall(
       },
     );
 
+    if (result.isError) internalDelivery?.onError?.(result);
     if (toolMeta.uiResourceUri) {
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/client").CallToolResult);
     }

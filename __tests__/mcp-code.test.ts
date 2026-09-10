@@ -128,7 +128,7 @@ describe("runMcpScript", () => {
   });
 
   it("uses script-local discovery guidance when a tool call misses", async () => {
-    const result = await runMcpScript(state, 'return await tools.call("missing_tool", {});');
+    const result = await runMcpScript(state, 'return await tools.capture("missing_tool", {});');
     const payload = JSON.parse(textBlocks(result).at(-1)!);
 
     expect(payload).toMatchObject({
@@ -276,7 +276,7 @@ describe("runMcpScript", () => {
   it("calls exact paths and returns an invalid-path envelope without throwing", async () => {
     const result = await runMcpScript(
       state,
-      'return { success: await tools.call("fixture_echo", { value: "canonical" }), invalid: await tools.call("", {}) };',
+      'return { success: await tools.call("fixture_echo", { value: "canonical" }), invalid: await tools.capture("", {}) };',
     );
 
     expect(JSON.parse(textBlocks(result).at(-1)!)).toMatchObject({
@@ -304,7 +304,7 @@ describe("runMcpScript", () => {
 
     const result = await runMcpScript(
       gatedState,
-      'return await tools.fixture_echo({ value: "blocked" });',
+      'return await tools.capture("fixture_echo", { value: "blocked" });',
     );
 
     expect(JSON.parse(textBlocks(result).at(-1)!)).toMatchObject({
@@ -364,6 +364,34 @@ describe("runMcpScript", () => {
     });
   });
 
+  it.each([100, 16384, 32768, 60000])("preserves script-readable results at %i bytes", async (bytes) => {
+    const result = await runMcpScript(state, `const r = await tools.fixture_echo({value: "x".repeat(${bytes})}); return {text: r.data.content[0].text.length, structured: r.data.structuredContent.echoed.length};`);
+    expect(result.details).not.toHaveProperty("error");
+    expect(JSON.parse(textBlocks(result).at(-1)!)).toEqual({text: bytes, structured: bytes});
+  });
+
+  it("replays twelve synthetic responses across the historical size boundary", async () => {
+    const sizes = [100, 15904, 6907, 11229, 13843, 16695];
+    const result = await runMcpScript(state, `
+      function parsed(r) {
+        const t = r.data.content.find(x => x.type === 'text').text;
+        const m = t.match(/### Result\\n([\\s\\S]*?)\\n### Ran/);
+        return JSON.parse(m[1]);
+      }
+      const results = [];
+      for (const size of ${JSON.stringify(sizes)}) {
+        await tools.fixture_echo({value:"synthetic navigation"});
+        const value = "### Result\\n" + JSON.stringify({payload:"x".repeat(size)}) + "\\n### Ran";
+        results.push(parsed(await tools.fixture_echo({value})).payload.length);
+      }
+      return results;
+    `);
+    expect(result.details).not.toHaveProperty("error");
+    expect(JSON.parse(textBlocks(result)[0])).toEqual(sizes);
+    expect(result.details.calls).toHaveLength(12);
+    expect(result.details.calls.every((call: { ok: boolean }) => call.ok)).toBe(true);
+  });
+
   it("filters a large intermediate to [7] without exposing raw data or spill metadata", async () => {
     const result = await runMcpScript(intermediateState, `
       const response = await tools.call("fixture_sized", { bytes: 128 * 1024 });
@@ -389,7 +417,7 @@ describe("runMcpScript", () => {
     const result = await runMcpScript(intermediateState, `
       const first = await tools.fixture_sized({ bytes: 8 * 1024 * 1024 });
       const second = await tools.fixture_sized({ bytes: 8 * 1024 * 1024 });
-      const excess = await tools.fixture_echo({ value: "over budget" });
+      const excess = await tools.capture("fixture_echo", { value: "over budget" });
       return { admitted: [first.ok, second.ok], excess, continued: true };
     `);
     expect(JSON.parse(textBlocks(result).at(-1)!)).toMatchObject({
@@ -406,7 +434,7 @@ describe("runMcpScript", () => {
 
   it("shares the cumulative budget across parallel calls without depending on admission order", async () => {
     const result = await runMcpScript(intermediateState, `
-      const responses = await Promise.all([1, 2, 3].map(() => tools.fixture_sized({ bytes: 6 * 1024 * 1024 })));
+      const responses = await Promise.all([1, 2, 3].map(() => tools.capture("fixture_sized", { bytes: 6 * 1024 * 1024 })));
       return responses.map(r => r.ok ? "admitted" : r.error.code).sort();
     `);
     expect(JSON.parse(textBlocks(result).at(-1)!)).toEqual(["admitted", "admitted", "intermediate_result_too_large"]);
@@ -419,7 +447,7 @@ describe("runMcpScript", () => {
   it("counts UTF-8 JSON bytes, rejects one byte over, and does not charge rejected bytes", async () => {
     const result = await runMcpScript(intermediateState, `
       await tools.fixture_sized({ bytes: 8 * 1024 * 1024 });
-      const rejected = await tools.fixture_sized({ bytes: 8 * 1024 * 1024 + 1, multibyte: true });
+      const rejected = await tools.capture("fixture_sized", { bytes: 8 * 1024 * 1024 + 1, multibyte: true });
       const exact = await tools.fixture_sized({ bytes: 8 * 1024 * 1024, multibyte: true });
       return { rejected, admitted: exact.ok, rows: exact.data?.structuredContent.rows ?? null, error: exact.error ?? null };
     `);
@@ -440,10 +468,10 @@ describe("runMcpScript", () => {
     ]);
   });
 
-  it("returns a failure envelope and lets the script continue", async () => {
+  it("requires explicit capture to continue after a failed call", async () => {
     const result = await runMcpScript(
       state,
-      "const failure = await tools.fixture_fail({}); return { failure, continued: true };",
+      'const failure = await tools.capture("fixture_fail", {}); return { failure, continued: true };',
     );
 
     expect(JSON.parse(textBlocks(result).at(-1)!)).toMatchObject({
@@ -457,6 +485,25 @@ describe("runMcpScript", () => {
       calls: [{ path: "fixture_fail", ok: false, error: "tool_error" }],
     });
     expect(result.details).not.toHaveProperty("error");
+  });
+
+  it.each(['tools.call("fixture_fail", {})', 'tools.fixture_fail({})'])("stops dependent calls after %s fails", async (call) => {
+    const result = await runMcpScript(state, `emit("checkpoint"); await ${call}; await tools.fixture_echo({value:"must not run"}); return {completed:true};`);
+    expect(result.details).toMatchObject({error:"script_error", calls:[{path:"fixture_fail",ok:false}], failure:{code:"tool_error",path:"fixture_fail",details:{mcpResult:{structuredContent:{code:"synthetic_failure",execution:"unknown"}}}}});
+    expect(textBlocks(result)[0]).toBe("checkpoint");
+    expect(textBlocks(result).join("\n")).not.toContain('"completed": true');
+  });
+
+  it("preserves structured failures for deliberate handling", async () => {
+    const result = await runMcpScript(state, 'const result = await tools.capture("fixture_fail",{}); return result.error.details.mcpResult;');
+    expect(result.details).not.toHaveProperty("error");
+    expect(JSON.parse(textBlocks(result)[0])).toMatchObject({isError:true,structuredContent:{code:"synthetic_failure",execution:"unknown"},_meta:{source:"synthetic"}});
+  });
+
+  it("rejects invalid paths by default", async () => {
+    const result = await runMcpScript(state, 'await tools.call("",{}); return "must not run";');
+    expect(result.details).toMatchObject({error:"script_error",failure:{code:"invalid_tool_path"}});
+    expect(result.details).not.toHaveProperty("calls");
   });
 
   it("does not treat promise/serialization probes as tool calls", async () => {
@@ -491,7 +538,7 @@ describe("runMcpScript", () => {
     );
 
     expect(Date.now() - start).toBeLessThan(2_000);
-    expect(result.details).not.toHaveProperty("error");
+    expect(result.details).toHaveProperty("error", "incomplete_calls");
     expect(result.details).toMatchObject({
       calls: [{ path: "fixture_hang", ok: false, error: "incomplete" }],
     });
@@ -556,6 +603,11 @@ describe("runMcpScript", () => {
     const block = textBlocks(result).at(-1)!;
     expect(block).not.toContain("Circular");
     expect(JSON.parse(block)).toEqual({ first: { id: "same" }, second: { id: "same" } });
+  });
+
+  it("supports URL construction without exposing network or process access", async () => {
+    const result = await runMcpScript(state, 'const url = new URL("https://example.com/synthetic"); url.search = new URLSearchParams({q:"quoted \\\"value\\\""}); return {query:url.searchParams.get("q"),network:typeof fetch,process:typeof process,timers:typeof setTimeout};');
+    expect(JSON.parse(textBlocks(result)[0])).toEqual({query:'quoted "value"',network:"undefined",process:"undefined",timers:"undefined"});
   });
 
   it("rejects tools enumeration with discovery guidance without exposing host globals", async () => {

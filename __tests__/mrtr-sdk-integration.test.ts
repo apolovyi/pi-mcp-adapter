@@ -290,19 +290,18 @@ describe("MCP 2026-07-28 SDK-native multi-round input flows", () => {
     });
   });
 
-  it("keeps the shaped error in mcpScript's existing failure envelope", async () => {
+  it.each(["call", "capture"])("preserves shaped UI failures through tools.%s", async (method) => {
     const { state } = await createConnectedState();
 
-    const result = await runMcpScript(state, 'return await tools.call("mrtr_needs_ui", {});');
-    const payload = JSON.parse(textOf(result));
+    const result = await runMcpScript(state, `return await tools.${method}("mrtr_needs_ui", {});`);
+    const failure = method === "capture" ? JSON.parse(textOf(result)).error : result.details.failure;
 
-    expect(payload).toMatchObject({
-      ok: false,
-      error: {
-        code: "input_required_needs_ui",
-        message: expect.stringContaining("Run this call in an interactive Pi session"),
-      },
+    expect(failure).toMatchObject({
+      code: "input_required_needs_ui",
+      message: expect.stringContaining("Run this call in an interactive Pi session"),
     });
+    if (method === "capture") expect(result.details).not.toHaveProperty("error");
+    else expect(result.details).toMatchObject({ error: "script_error" });
     expect(result.details).toMatchObject({
       mode: "script",
       calls: [{ path: "mrtr_needs_ui", ok: false, error: "input_required_needs_ui" }],

@@ -1,4 +1,5 @@
 import { Ajv } from "ajv";
+import { normalizeToolArguments } from "./utils.ts";
 import Ajv2020Import from "ajv/dist/2020.js";
 import addFormatsImport from "ajv-formats";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/ajv";
@@ -31,6 +32,31 @@ function schemaDialect(schema: JsonSchemaType): SchemaDialect {
     status: "stamped",
     uri: schema.$schema.endsWith("#") ? schema.$schema.slice(0, -1) : schema.$schema,
   };
+}
+
+type PreparedArguments =
+  | { ok: true; args: Record<string, unknown> }
+  | { ok: false; error: "invalid_arguments" | "invalid_tool_schema"; message: string };
+
+export function prepareToolArguments(value: unknown, schema?: unknown): PreparedArguments {
+  let args: Record<string, unknown>;
+  try {
+    args = normalizeToolArguments(value);
+  } catch (error) {
+    return { ok: false, error: "invalid_arguments", message: String(error) };
+  }
+  if (schema === undefined) return { ok: true, args };
+  try {
+    if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+      throw new Error("Tool input schema must be an object");
+    }
+    const validation = createJsonSchemaValidator().getValidator(schema as JsonSchemaType)(args);
+    return validation.valid
+      ? { ok: true, args }
+      : { ok: false, error: "invalid_arguments", message: `${validation.errorMessage}. Inspect the current tool schema before retrying.` };
+  } catch (error) {
+    return { ok: false, error: "invalid_tool_schema", message: `${String(error)}. Repair the server's input schema before retrying.` };
+  }
 }
 
 export function createJsonSchemaValidator(): JsonSchemaValidatorProvider {
