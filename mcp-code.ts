@@ -27,7 +27,7 @@ type WorkerMessage =
   | { type: "search"; id: number; input?: unknown }
   | { type: "describe"; id: number; input?: unknown }
   | { type: "done"; returnBlock?: unknown }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string; failure?: unknown };
 
 type WorkerResultMessage = { type: "result"; id: number; envelope: unknown };
 
@@ -99,7 +99,7 @@ function parseWorkerMessage(value: unknown): WorkerMessage | null {
     return "returnBlock" in message ? { type: "done", returnBlock: message.returnBlock } : { type: "done" };
   }
   if (message.type === "error" && typeof message.message === "string") {
-    return { type: "error", message: message.message };
+    return { type: "error", message: message.message, failure: message.failure };
   }
   return null;
 }
@@ -154,7 +154,7 @@ export async function runMcpScript(
       calls[index] = { operation: "call", path, ok: false, error: errorCode, durationMs: Date.now() - startedAt, startedAt };
       return {
         ok: false as const,
-        error: { code: errorCode, message },
+        error: { code: errorCode, message, path, details: { ...Object.fromEntries(Object.entries(details).filter(([, value]) => value !== undefined)), ...(mcpResult !== undefined ? { mcpResult } : {}) } },
       };
     }
     calls[index] = { operation: "call", path, ok: true, durationMs: Date.now() - startedAt, startedAt };
@@ -238,8 +238,9 @@ export async function runMcpScript(
   let worker: Worker | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let removeAbortListener = () => {};
-  let errorCode: "timeout" | "aborted" | "script_error" | undefined;
+  let errorCode: "timeout" | "aborted" | "script_error" | "incomplete_calls" | undefined;
   let errorMessage: string | undefined;
+  let failure: unknown;
 
   try {
     if (externalSignal?.aborted) {
@@ -272,6 +273,7 @@ export async function runMcpScript(
         }
         if (message.type === "error") {
           completed = true;
+          failure = message.failure;
           reject(new Error(message.message));
           return;
         }
@@ -331,20 +333,21 @@ export async function runMcpScript(
   } finally {
     clearTimeout(timer);
     removeAbortListener();
-    // "incomplete" means the call had not settled when the script finished
-    // (deadline, abort, or early return). Snapshot before aborting stragglers.
     callsSnapshot ??= snapshotCalls();
-    // A script may finish without awaiting every call; abort leftovers so
-    // parent-side dispatches do not outlive the script.
     timeoutController.abort(new Error("mcpScript finished"));
     await worker?.terminate();
   }
 
-  // Snapshot before the asynchronous output guard; the terminated worker can no longer emit.
+  if (!errorCode && callsSnapshot.some((call) => !call.ok && call.error === "incomplete")) {
+    errorCode = "incomplete_calls";
+    errorMessage = "mcpScript returned with unfinished calls. Remote execution is unknown; inspect state before retrying.";
+    output.push({ type: "text", text: errorMessage });
+  }
   const guarded = await guardMcpOutput(
     output.length > 0 ? [...output] : [{ type: "text", text: "(no output)" }],
-    resolveMcpOutputGuardOptions(state.config.settings),
+    { ...resolveMcpOutputGuardOptions(state.config.settings), ...(failure !== undefined ? { rawMcpResult: failure } : {}) },
   );
+  const { mcpResult: guardedFailure, ...displayDetails } = guardedMcpDetails(guarded);
   return {
     content: guarded.content,
     details: {
@@ -352,7 +355,8 @@ export async function runMcpScript(
       ...(errorCode ? { error: errorCode, message: errorMessage } : {}),
       timeoutMs: resolvedTimeoutMs,
       ...(callsSnapshot.length > 0 ? { calls: callsSnapshot } : {}),
-      ...guardedMcpDetails(guarded),
+      ...(guardedFailure !== undefined ? { failure: guardedFailure } : {}),
+      ...displayDetails,
     },
   };
 }
