@@ -811,6 +811,7 @@ export async function executeCall(
   getPiTools?: () => ToolInfo[],
   signal?: AbortSignal,
   origin?: "proxy" | "script",
+  onMcpResult?: (result: ClientCallToolResult | ClientReadResourceResult) => void,
 ): Promise<ProxyToolResult> {
   const ownedSignal = combineAbortSignals(state.owner?.signal, signal);
   throwIfAborted(ownedSignal);
@@ -1206,6 +1207,7 @@ export async function executeCall(
         serverName,
         (conn) => conn.client.readResource({ uri: toolMeta.resourceUri! }, requestOptions),
       );
+      onMcpResult?.(result);
       const content = transformMcpResourceContents(result.contents ?? [], state.owner?.signal);
       const guarded = await guardMcpOutput(content.length > 0 ? content : [{ type: "text" as const, text: "(empty resource)" }], outputGuardOptions);
       return {
@@ -1241,6 +1243,7 @@ export async function executeCall(
       }, requestOptions), ownedSignal),
     );
 
+    onMcpResult?.(result);
     if (toolMeta.uiResourceUri) {
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/client").CallToolResult);
 

@@ -136,10 +136,10 @@ export async function runMcpScript(
   }));
   let callsSnapshot: ScriptOperation[] | undefined;
   const callTool = async (path: string, args?: Record<string, unknown>) => {
-    // Record before dispatch so calls still in flight at timeout/abort appear in the trace.
     const startedAt = Date.now();
     const index = calls.push({ operation: "call", path, ok: false, error: "incomplete", durationMs: 0, startedAt }) - 1;
-    const result = await executeCall(state, path, args, undefined, getPiTools, callSignal, "script");
+    let mcpResult: unknown;
+    const result = await executeCall(state, path, args, undefined, getPiTools, callSignal, "script", (raw) => { mcpResult = raw; });
     const details = result.details;
     if (details.error !== undefined) {
       const errorCode = String(details.error);
@@ -160,7 +160,7 @@ export async function runMcpScript(
     calls[index] = { operation: "call", path, ok: true, durationMs: Date.now() - startedAt, startedAt };
     return {
       ok: true as const,
-      data: details.mcpResult !== undefined ? details.mcpResult : textFromContent(result.content),
+      data: mcpResult ?? textFromContent(result.content),
     };
   };
 

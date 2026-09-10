@@ -7,11 +7,15 @@ describe("toolErrorOverride", () => {
     expect(toolErrorOverride({ mode: "call", error: "call_failed", message: "boom" })).toEqual({ isError: true });
   });
 
-  it("leaves the adapter's other details.error codes as successes (auth, connection, validation, routing)", () => {
+  it.each(["script_error", "timeout", "aborted"])("flags %s without losing details", (error) => {
+    expect(toolErrorOverride({mode: "script", error})).toEqual({isError: true});
+  });
+
+  it("leaves control feedback without a failed call unchanged", () => {
     for (const code of ["auth_required", "not_connected", "empty_query", "tool_not_found"]) {
       expect(toolErrorOverride({ error: code }), code).toBeUndefined();
     }
-    expect(toolErrorOverride({ ok: true })).toBeUndefined(); // no error breadcrumb at all
+    expect(toolErrorOverride({ ok: true })).toBeUndefined();
   });
 
   it("returns only { isError: true } so pi's field-by-field merge keeps content and details", () => {
