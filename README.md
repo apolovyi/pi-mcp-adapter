@@ -6,6 +6,16 @@
 
 Use MCP servers with [Pi](https://github.com/badlogic/pi-mono/) without burning your context window.
 
+## My contributions
+
+My work in this fork of [Pi MCP Adapter](https://github.com/nicobailon/pi-mcp-adapter) focuses on execution correctness:
+
+- **Fail-fast scripting:** stop dependent calls after a failure, preserve structured error evidence, and require explicit handling to continue. [Code and tests](https://github.com/apolovyi/pi-mcp-adapter/commit/0c0aa18cd119a4e5a2c540adb84149c6e9afcde3).
+- **Input validation:** reject invalid arguments before approval or dispatch across proxy, direct-tool and script entry points. [Code and tests](https://github.com/apolovyi/pi-mcp-adapter/commit/78d0398c10a7badd1522d69fbae14bac72c35d0b).
+- **Process lifecycle:** keep helper discovery from blocking command cleanup while preserving buffered output. [Code and tests](https://github.com/apolovyi/pi-mcp-adapter/commit/cfaf05fa6522748ac51836706fe1022b1c7b3b24).
+
+## Upstream project
+
 https://github.com/user-attachments/assets/4b7c66ff-e27e-4639-b195-22c3db406a5a
 
 ## Why This Exists
