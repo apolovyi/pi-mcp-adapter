@@ -1477,9 +1477,14 @@ export async function executeCall(
 
   const prepared = toolMeta.resourceUri ? { ok: true as const, args: args ?? {} } : prepareToolArguments(args, toolMeta.inputSchema);
   if (!prepared.ok) {
+    const schemaText = prepared.error === "invalid_arguments" ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
+    const guarded = await guardMcpOutput(
+      [{ type: "text" as const, text: prepared.message }],
+      { ...resolveMcpOutputGuardOptions(state.config.settings), suffix: schemaText },
+    );
     return {
-      content: [{ type: "text", text: prepared.message }],
-      details: { mode: "call", error: prepared.error, message: prepared.message, phase: "validation", execution: "not_started", ...callIdentity },
+      content: guarded.content,
+      details: { mode: "call", error: prepared.error, message: prepared.message, phase: "validation", execution: "not_started", ...callIdentity, ...guardedMcpDetails(guarded) },
     };
   }
   const normalizedArgs = prepared.args;

@@ -169,8 +169,7 @@ describe("mcpScript jev.evaluate", () => {
     });
     const earlyState = makeState();
     const early = await runMcpScript(earlyState, `jev.evaluate(${JSON.stringify(input)}); return "done";`, 2_000, undefined, undefined, evaluator);
-    expect(text(early)).toBe("done");
-    expect(early.details).toMatchObject({ calls: [{ operation: "evaluate", ok: false, error: "incomplete" }] });
+    expect(early.details).toMatchObject({ error: "incomplete_calls", calls: [{ operation: "evaluate", ok: false, error: "incomplete" }] });
     expect(signals[0]?.aborted).toBe(true);
 
     const ownerState = makeState();

@@ -3355,9 +3355,11 @@ describe("mcpAdapter session lifecycle", () => {
     // the call itself threw and was caught (proxy path) -> tagged call_failed
     expect(toolResult?.({ details: { mode: "call", error: "call_failed", message: "boom" } })).toEqual({ isError: true });
     expect(toolResult?.({ details: { mode: "call", error: "input_required_needs_ui", server: "demo" } })).toEqual({ isError: true });
+    expect(toolResult?.({ details: { mode: "script", error: "script_error" } })).toEqual({ isError: true });
+    // a script that captured and handled a failed call succeeded -> left untouched
     expect(toolResult?.({
       details: { mode: "script", calls: [{ path: "demo_needs_ui", ok: false, error: "input_required_needs_ui" }] },
-    })).toEqual({ isError: true });
+    })).toBeUndefined();
     // a precondition code is not a tool-execution failure -> left untouched
     expect(toolResult?.({ details: { error: "auth_required", server: "demo" } })).toBeUndefined();
   });

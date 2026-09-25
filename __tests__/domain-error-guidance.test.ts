@@ -69,7 +69,7 @@ describe("server-returned domain errors", () => {
 
     expect(text(result)).toContain("Expected parameters:");
     expect(text(result)).toContain("id (string) *required*");
-    expect(result.details).toMatchObject({ error: "call_failed", server: "demo" });
+    expect(result.details).toMatchObject({ error: "invalid_arguments", phase: "validation", execution: "not_started", server: "demo" });
     expect(callTool).not.toHaveBeenCalled();
   });
 

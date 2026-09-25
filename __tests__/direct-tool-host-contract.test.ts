@@ -101,6 +101,7 @@ describe("direct tool host contracts", () => {
       client: { callTool: vi.fn().mockResolvedValue(rawResult) },
     };
     const state = {
+      toolMetadata: new Map(),
       config: {
         settings: { directToolResultDetails: "bounded" },
         mcpServers: { demo: { command: "demo" } },
@@ -141,6 +142,7 @@ describe("direct tool host contracts", () => {
     };
     const close = vi.fn(async () => {});
     const state = {
+      toolMetadata: new Map(),
       config: {
         settings: {},
         mcpServers: { demo: { command: "demo" } },
@@ -181,6 +183,7 @@ describe("direct tool host contracts", () => {
       client: { readResource: vi.fn().mockResolvedValue(rawResult) },
     };
     const state = {
+      toolMetadata: new Map(),
       config: {
         settings: { directToolResultDetails: "bounded" },
         mcpServers: { demo: { command: "demo" } },

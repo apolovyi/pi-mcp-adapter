@@ -70,9 +70,9 @@ describe("approval broker through Pi registered script calls", () => {
         const result = await script!.execute("approval-script", {
           code: `
             const first = await tools.call("fixture_echo", { value: "same" });
-            const second = await tools.call("fixture_echo", { value: "same" });
+            const second = await tools.capture("fixture_echo", { value: "same" });
             const third = await tools.call("fixture_echo", { value: "same" });
-            const uncached = await tools.call("fixture_echo", { value: "new" });
+            const uncached = await tools.capture("fixture_echo", { value: "new" });
             return [first, second, third, uncached];
           `,
         }, undefined, undefined, session.extensionRunner.createContext());
